@@ -1,0 +1,22 @@
+{
+    "name": "anima-rag",
+    "version": "1.0.0",
+    "description": "Anima RAG: Backend 2-1-2-1 Logic",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "postinstall": "patch-package"
+    },
+    "keywords": [
+        "sillytavern",
+        "rag",
+        "vectra"
+    ],
+    "author": "User",
+    "license": "MIT",
+    "dependencies": {
+        "patch-package": "^8.0.0",
+        "postinstall-postinstall": "^2.1.0",
+        "vectra": "^0.12.3"
+    }
+}
