@@ -1,3 +1,24 @@
+if (typeof global.File === "undefined") {
+    console.log(
+        "[Anima RAG] ⚠️ 检测到旧版 Node.js (< v20)，正在注入 File Polyfill...",
+    );
+    global.File = class File {
+        constructor(fileBits, fileName, options) {
+            this.name = fileName;
+            this.type = options?.type || "";
+            this.lastModified = options?.lastModified || Date.now();
+            this._bits = fileBits;
+        }
+    };
+}
+
+// 🛠️ 兼容性补丁：防止 fetch 缺失 (Node < 18)
+if (typeof global.fetch === "undefined") {
+    console.error(
+        "[Anima RAG] ❌ 致命错误: 当前 Node.js 版本过低，不支持 fetch。请升级至 Node 18+ (推荐 v20)",
+    );
+}
+
 const path = require("path");
 const fs = require("fs");
 const { LocalIndex } = require("vectra");
