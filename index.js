@@ -383,7 +383,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
         switch (step.type) {
             case "base":
-                stepCoeff = 1.5;
+                stepCoeff = 1;
                 break;
             case "important":
                 // 重要检索：极易重复，需要深挖 (例如: 全局2.0 * 2.5 = 5倍候选)
@@ -444,9 +444,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                 break;
 
             case "important":
-                // Step 2: 重要检索 (修改版：分路检索)
-                // 如果标签是 [Important, Serious]，count=1
-                // 结果 = 1条 Important + 1条 Serious
                 if (step.labels && step.labels.length > 0) {
                     detectedImportantLabels = step.labels; // 记录用于后续排除
 
@@ -455,7 +452,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             indices,
                             vector,
                             candidateK,
-                            // 对每个标签单独建立过滤，而不是用 $in 混合
                             buildFilter({ tags: { $in: [label] } }),
                             "Chat",
                         ),
@@ -465,7 +461,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     // 强制均衡：确保每个标签都贡献 step.count 个结果
                     const balancedResults = impResults.map((list) => {
                         list.sort((a, b) => b.score - a.score);
-                        return list.slice(0, step.count);
+                        return list; // ✅ 改为直接返回完整列表
                     });
 
                     candidates = balancedResults.flat();
@@ -483,8 +479,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             indices,
                             vector,
                             candidateK,
-                            // 注意：这里我们只按标签筛选，不在此处排除 ID，
-                            // 防止不同标签检索出同一条记录时被误杀，ID排重留给最后统一处理
                             buildFilter({ tags: { $in: [label] } }),
                             "Chat",
                         ),
@@ -496,10 +490,9 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     // 而不是把所有结果混在一起按分数排序（那样可能会导致高分标签挤掉低分标签）。
                     // 所以我们在合并前，先对每个结果集进行截断。
                     const balancedResults = statusResults.map((list) => {
-                        // 确保每个子列表也是按分数排序的
                         list.sort((a, b) => b.score - a.score);
-                        // 强制截取 step.count 个
-                        return list.slice(0, step.count);
+                        // ❌ 删除这行: return list.slice(0, step.count);
+                        return list; // ✅
                     });
 
                     candidates = balancedResults.flat();
@@ -539,7 +532,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
                     const balancedResults = specialResults.map((list) => {
                         list.sort((a, b) => b.score - a.score);
-                        return list.slice(0, step.count);
+                        return list; // ✅
                     });
 
                     candidates = balancedResults.flat();
