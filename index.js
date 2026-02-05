@@ -1257,9 +1257,6 @@ async function init(router) {
     });
 
     router.post("/merge", async (req, res) => {
-        // 1. 接收参数
-        // sourceIds: ["chat_A", "chat_B"] (要合并的来源库列表)
-        // targetId: "merged_library_01" (用户自定义的目标库名)
         const { sourceIds, targetId } = req.body;
 
         if (!sourceIds || !Array.isArray(sourceIds) || sourceIds.length === 0) {
@@ -1269,34 +1266,40 @@ async function init(router) {
             return res.status(400).send("Target collection ID is required");
         }
 
-        // 2. 清洗目标库名 (防止路径攻击或非法字符)
         const safeTargetName = targetId.replace(
             /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
             "_",
         );
 
-        console.log(`[Anima Merge] 🚀 开始合并任务`);
+        console.log(`[Anima Merge] 🚀 开始合并任务 (深度读取模式)`);
         console.log(`   - 来源: ${sourceIds.join(", ")}`);
         console.log(`   - 目标: ${safeTargetName}`);
 
         try {
-            // 使用队列锁住目标库，防止写入冲突
             await runInQueue(safeTargetName, async () => {
-                // 3. 初始化目标库 (允许创建)
-                // 注意：如果目标库已存在，这里会直接加载它，新数据会追加进去
+                // 1. 初始化目标库
                 const targetIndex = await getIndex(safeTargetName, true);
 
                 let successCount = 0;
                 let failCount = 0;
 
-                // 4. 遍历所有来源库
+                // 2. 遍历所有来源库
                 for (const srcId of sourceIds) {
                     try {
-                        console.log(`[Anima Merge] 正在读取源库: ${srcId}...`);
+                        // 获取源库的文件夹路径
+                        const safeSrcName = srcId.replace(
+                            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+                            "_",
+                        );
+                        const srcFolderPath = path.join(
+                            VECTOR_ROOT,
+                            safeSrcName,
+                        );
 
-                        // 获取源库实例 (不允许创建，如果不存在返回 null)
+                        console.log(`[Anima Merge] 正在处理源库: ${srcId} ...`);
+
+                        // 加载索引以获取 ID 列表和 Vector
                         const sourceIndex = await getIndex(srcId, false);
-
                         if (!sourceIndex) {
                             console.warn(
                                 `[Anima Merge] ⚠️ 源库不存在，跳过: ${srcId}`,
@@ -1304,46 +1307,72 @@ async function init(router) {
                             continue;
                         }
 
-                        // 获取源库所有条目
                         const items = await sourceIndex.listItems();
 
-                        // 5. 搬运条目
+                        // 3. 搬运条目 (这是核心修改部分)
                         for (const item of items) {
                             try {
-                                // 深度复制 metadata，防止引用干扰
-                                const newMetadata = { ...item.metadata };
+                                // A. 构建源文件的物理路径
+                                // vectra 通常用 item.id + ".json"
+                                const fileName =
+                                    item.metadataFile || `${item.id}.json`;
+                                const filePath = path.join(
+                                    srcFolderPath,
+                                    fileName,
+                                );
 
-                                // ✨ 注入来源标记 (即使现在不用，未来排查问题也很有用)
-                                newMetadata._merge_source = srcId;
-                                newMetadata._merged_at = Date.now();
+                                // B. 🔥 核心修复：必须从磁盘读取完整内容！
+                                if (!fs.existsSync(filePath)) {
+                                    console.warn(
+                                        `[Anima Merge] ❌ 丢失物理文件: ${fileName}`,
+                                    );
+                                    failCount++;
+                                    continue;
+                                }
 
-                                // 插入到目标库
-                                // 注意：这里不传 id，让 vectra 为目标库生成全新的 UUID
-                                // 这样可以避免不同源库里可能有相同 UUID 导致的冲突
+                                const fileContent = await fs.promises.readFile(
+                                    filePath,
+                                    "utf-8",
+                                );
+                                const fullData = JSON.parse(fileContent);
+
+                                // C. 提取完整 Metadata (兼容数据结构)
+                                // 有些版本数据直接在 root，有些在 metadata 字段下
+                                const originalMetadata =
+                                    fullData.metadata || fullData;
+
+                                // D. 准备新的 Metadata
+                                const newMetadata = {
+                                    ...originalMetadata, // 这里面包含了 text, timestamp, tags 等所有数据
+                                    _merge_source: srcId,
+                                    _merged_at: Date.now(),
+                                };
+
+                                // E. 插入到目标库 (让 vectra 生成新 UUID)
                                 await targetIndex.insertItem({
-                                    vector: item.vector,
+                                    vector: item.vector, // 向量可以直接从索引取，这个没问题
                                     metadata: newMetadata,
                                 });
+
                                 successCount++;
-                            } catch (insertErr) {
+                            } catch (readErr) {
                                 console.error(
-                                    `[Anima Merge] 单条搬运失败: ${insertErr.message}`,
+                                    `[Anima Merge] 读取/写入单条失败 (${item.id}): ${readErr.message}`,
                                 );
                                 failCount++;
                             }
                         }
                     } catch (libErr) {
                         console.error(
-                            `[Anima Merge] 读取源库 ${srcId} 失败: ${libErr.message}`,
+                            `[Anima Merge] 处理源库 ${srcId} 异常: ${libErr.message}`,
                         );
                     }
                 }
 
                 console.log(
-                    `[Anima Merge] ✅ 合并完成! 成功搬运: ${successCount}, 失败: ${failCount}`,
+                    `[Anima Merge] ✅ 合并完成! 成功: ${successCount}, 失败: ${failCount}`,
                 );
 
-                // 返回结果
                 res.json({
                     success: true,
                     targetId: safeTargetName,
@@ -1352,6 +1381,119 @@ async function init(router) {
             });
         } catch (err) {
             console.error(`[Anima Merge] Critical Error: ${err.message}`);
+            res.status(500).send(err.message);
+        }
+    });
+
+    router.post("/rebuild_collection", async (req, res) => {
+        const { collectionId, apiConfig } = req.body;
+
+        if (!collectionId) return res.status(400).send("Missing collectionId");
+        // 校验 API 配置
+        if (!apiConfig || !apiConfig.key)
+            return res.status(400).send("Missing API Config");
+
+        const safeName = collectionId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+
+        console.log(`[Anima Rebuild] 🚀 开始重建库: ${safeName}`);
+
+        try {
+            await runInQueue(safeName, async () => {
+                const targetIndex = await getIndex(safeName, false); // 必须存在
+                if (!targetIndex) {
+                    throw new Error("Collection not found");
+                }
+
+                const items = await targetIndex.listItems();
+                const folderPath = path.join(VECTOR_ROOT, safeName);
+
+                let successCount = 0;
+                let failCount = 0;
+
+                // 遍历所有条目
+                for (const item of items) {
+                    try {
+                        // 1. 读取物理文件获取文本
+                        const fileName = item.metadataFile || `${item.id}.json`;
+                        const filePath = path.join(folderPath, fileName);
+
+                        if (!fs.existsSync(filePath)) {
+                            console.warn(
+                                `[Anima Rebuild] ❌ 文件丢失: ${fileName}`,
+                            );
+                            failCount++;
+                            continue;
+                        }
+
+                        const fileContent = await fs.promises.readFile(
+                            filePath,
+                            "utf-8",
+                        );
+                        const fullData = JSON.parse(fileContent);
+                        // 兼容元数据位置
+                        const meta = fullData.metadata || fullData;
+                        const text = meta.text;
+
+                        if (!text) {
+                            console.warn(
+                                `[Anima Rebuild] ⚠️ 条目无文本，跳过: ${item.id}`,
+                            );
+                            failCount++;
+                            continue;
+                        }
+
+                        // 2. 重新向量化 (调用 OpenAI/DeepSeek)
+                        // 注意：这里是串行的，速度较慢，但安全
+                        const newVector = await getEmbedding(text, apiConfig);
+
+                        // 3. 更新数据库
+                        // Vectra 没有原地的 update，我们需要：先删 -> 后加
+                        // 为了保留原来的 ID 引用（如果有外部依赖），理想情况是保留 ID。
+                        // 但 RAG 系统通常只依赖内容，生成新 ID 也是安全的。
+                        // 为了稳妥，我们采用“删除旧条目 -> 插入新条目”
+
+                        // A. 删除旧的
+                        await targetIndex.deleteItem(item.id);
+                        // 同时删除旧物理文件（因为 insertItem 会生成新的）
+                        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+                        // B. 插入新的 (携带旧的 metadata)
+                        await targetIndex.insertItem({
+                            vector: newVector,
+                            metadata: meta, // 包含 timestamp, index, batch_id, tags 等
+                        });
+
+                        successCount++;
+
+                        // 简单的后端日志进度
+                        if (successCount % 5 === 0)
+                            console.log(
+                                `[Anima Rebuild] ${safeName}: ${successCount}/${items.length}`,
+                            );
+                    } catch (err) {
+                        console.error(
+                            `[Anima Rebuild] 单条失败 (${item.id}): ${err.message}`,
+                        );
+                        failCount++;
+                    }
+                }
+
+                console.log(
+                    `[Anima Rebuild] ✅ 库 ${safeName} 重建完毕. 成功: ${successCount}, 失败: ${failCount}`,
+                );
+
+                res.json({
+                    success: true,
+                    collectionId: safeName,
+                    stats: { success: successCount, failed: failCount },
+                });
+            });
+        } catch (err) {
+            console.error(`[Anima Rebuild] Error: ${err.message}`);
+            // 发送 500 会导致前端 catch，包含错误信息
             res.status(500).send(err.message);
         }
     });
