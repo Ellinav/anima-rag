@@ -1176,17 +1176,25 @@ async function init(router) {
 
             // 设置下载头
             res.set("Content-Type", "application/zip");
+
+            // 🔥【核心修复】文件名编码
+            // Node.js 禁止 Header 含中文。我们使用 encodeURIComponent 确保安全。
+            // 前端 rag.js 会拦截 Blob 并重新命名，所以这里的文件名主要是为了协议合规。
+            const encodedName = encodeURIComponent(safeName);
+
             res.set(
                 "Content-Disposition",
-                `attachment; filename=${safeName}.zip`,
+                `attachment; filename="${encodedName}.zip"; filename*=UTF-8''${encodedName}.zip`,
             );
+
             res.set("Content-Length", buffer.length);
             res.send(buffer);
 
             console.log(`[Anima RAG] 📤 导出数据库成功: ${safeName}`);
         } catch (e) {
             console.error(`[Anima RAG] Export Error: ${e.message}`);
-            res.status(500).send(e.message);
+            // 只有当 Header 还没发出去时才发送 500，防止二次报错
+            if (!res.headersSent) res.status(500).send(e.message);
         }
     });
 
@@ -1245,6 +1253,106 @@ async function init(router) {
         } catch (e) {
             console.error(`[Anima RAG] Import Error: ${e.message}`);
             res.status(500).send(e.message);
+        }
+    });
+
+    router.post("/merge", async (req, res) => {
+        // 1. 接收参数
+        // sourceIds: ["chat_A", "chat_B"] (要合并的来源库列表)
+        // targetId: "merged_library_01" (用户自定义的目标库名)
+        const { sourceIds, targetId } = req.body;
+
+        if (!sourceIds || !Array.isArray(sourceIds) || sourceIds.length === 0) {
+            return res.status(400).send("No source collections provided");
+        }
+        if (!targetId) {
+            return res.status(400).send("Target collection ID is required");
+        }
+
+        // 2. 清洗目标库名 (防止路径攻击或非法字符)
+        const safeTargetName = targetId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+
+        console.log(`[Anima Merge] 🚀 开始合并任务`);
+        console.log(`   - 来源: ${sourceIds.join(", ")}`);
+        console.log(`   - 目标: ${safeTargetName}`);
+
+        try {
+            // 使用队列锁住目标库，防止写入冲突
+            await runInQueue(safeTargetName, async () => {
+                // 3. 初始化目标库 (允许创建)
+                // 注意：如果目标库已存在，这里会直接加载它，新数据会追加进去
+                const targetIndex = await getIndex(safeTargetName, true);
+
+                let successCount = 0;
+                let failCount = 0;
+
+                // 4. 遍历所有来源库
+                for (const srcId of sourceIds) {
+                    try {
+                        console.log(`[Anima Merge] 正在读取源库: ${srcId}...`);
+
+                        // 获取源库实例 (不允许创建，如果不存在返回 null)
+                        const sourceIndex = await getIndex(srcId, false);
+
+                        if (!sourceIndex) {
+                            console.warn(
+                                `[Anima Merge] ⚠️ 源库不存在，跳过: ${srcId}`,
+                            );
+                            continue;
+                        }
+
+                        // 获取源库所有条目
+                        const items = await sourceIndex.listItems();
+
+                        // 5. 搬运条目
+                        for (const item of items) {
+                            try {
+                                // 深度复制 metadata，防止引用干扰
+                                const newMetadata = { ...item.metadata };
+
+                                // ✨ 注入来源标记 (即使现在不用，未来排查问题也很有用)
+                                newMetadata._merge_source = srcId;
+                                newMetadata._merged_at = Date.now();
+
+                                // 插入到目标库
+                                // 注意：这里不传 id，让 vectra 为目标库生成全新的 UUID
+                                // 这样可以避免不同源库里可能有相同 UUID 导致的冲突
+                                await targetIndex.insertItem({
+                                    vector: item.vector,
+                                    metadata: newMetadata,
+                                });
+                                successCount++;
+                            } catch (insertErr) {
+                                console.error(
+                                    `[Anima Merge] 单条搬运失败: ${insertErr.message}`,
+                                );
+                                failCount++;
+                            }
+                        }
+                    } catch (libErr) {
+                        console.error(
+                            `[Anima Merge] 读取源库 ${srcId} 失败: ${libErr.message}`,
+                        );
+                    }
+                }
+
+                console.log(
+                    `[Anima Merge] ✅ 合并完成! 成功搬运: ${successCount}, 失败: ${failCount}`,
+                );
+
+                // 返回结果
+                res.json({
+                    success: true,
+                    targetId: safeTargetName,
+                    stats: { success: successCount, failed: failCount },
+                });
+            });
+        } catch (err) {
+            console.error(`[Anima Merge] Critical Error: ${err.message}`);
+            res.status(500).send(err.message);
         }
     });
 
