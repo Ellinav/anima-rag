@@ -130,12 +130,27 @@ async function getEmbedding(text, config) {
         });
 
         if (!response.ok) {
-            // 🔥 [新增调试日志] 打印详细错误文本
             const errText = await response.text();
-            console.error(
-                `[Anima Debug] API Error Response: ${response.status} - ${errText}`,
-            );
-            throw new Error(errText);
+            let cleanMessage = "Unknown API Error";
+            try {
+                // 尝试解析 JSON
+                const errJson = JSON.parse(errText);
+                // 优先取 error.message (OpenAI标准), 其次 message, 最后 raw
+                cleanMessage =
+                    errJson.error?.message ||
+                    errJson.message ||
+                    JSON.stringify(errJson);
+            } catch (e) {
+                // 解析失败，说明是 HTML (如 Nginx 报错页)
+                // 1. 使用正则剥离所有标签
+                let stripped = errText.replace(/<[^>]*>?/gm, "").trim();
+                // 2. 截取前 100 字符，防止整页 HTML 文本刷屏
+                // 3. 移除多余空白符
+                cleanMessage = stripped.replace(/\s+/g, " ").substring(0, 100);
+                if (!cleanMessage)
+                    cleanMessage = `HTTP Error ${response.status}`;
+            }
+            throw new Error(cleanMessage);
         }
 
         const data = await response.json();
@@ -770,7 +785,44 @@ async function init(router) {
         } catch (err) {
             console.error("[Anima RAG Insert Error]", err);
             // 防止 headers 已经发送的情况
-            if (!res.headersSent) res.status(500).send(err.message);
+            if (!res.headersSent) {
+                // 修改：改为返回 JSON 对象，不要直接传 err.message
+                res.status(500).json({
+                    success: false,
+                    message: err.message || "未知后端错误",
+                });
+            }
+        }
+    });
+
+    router.post("/test_connection", async (req, res) => {
+        const { apiConfig } = req.body;
+
+        if (!apiConfig || !apiConfig.key) {
+            return res.status(400).send("缺少 API 配置或 Key");
+        }
+
+        try {
+            console.log(
+                `[Anima RAG] 🧪 正在测试连接: ${apiConfig.model} @ ${apiConfig.url}`,
+            );
+
+            // 使用 "Hello World" 进行一次极简的向量化测试
+            const vector = await getEmbedding("Test Connection", apiConfig);
+
+            if (vector && vector.length > 0) {
+                res.json({
+                    success: true,
+                    message: `连接成功！向量维度: ${vector.length}`,
+                    dimension: vector.length,
+                });
+            } else {
+                throw new Error("API 返回了空向量");
+            }
+        } catch (err) {
+            console.error(`[Anima RAG] 测试失败: ${err.message}`);
+            // 将错误信息返回给前端
+            res.status(500).send(err.message);
         }
     });
 
