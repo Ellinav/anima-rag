@@ -586,7 +586,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
         switch (step.type) {
             case "base":
-                stepCoeff = 4;
+                stepCoeff = 5;
                 break;
             case "important":
                 // 重要检索：极易重复，需要深挖 (例如: 全局2.0 * 2.5 = 5倍候选)
