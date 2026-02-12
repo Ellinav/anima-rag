@@ -25,6 +25,7 @@ const { LocalIndex } = require("vectra");
 const AdmZip = require("adm-zip");
 
 const VECTOR_ROOT = path.join(__dirname, "vectors");
+const SESSION_ROOT = path.join(__dirname, "data", "sessions");
 const activeIndexes = new Map();
 const writeQueues = new Map();
 const loadingPromises = new Map();
@@ -104,6 +105,209 @@ function chunkText(text, strategy) {
     }
 
     return chunks;
+}
+
+function loadSession(sessionId) {
+    if (!sessionId) return { memories: [] };
+    try {
+        const safeId = sessionId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+        const filePath = path.join(SESSION_ROOT, `${safeId}.json`);
+
+        if (!fs.existsSync(filePath)) return { memories: [] };
+
+        const data = fs.readFileSync(filePath, "utf-8");
+        return JSON.parse(data) || { memories: [] };
+    } catch (e) {
+        console.warn(
+            `[Anima Session] Load failed for ${sessionId}: ${e.message}`,
+        );
+        return { memories: [] };
+    }
+}
+
+// ✅ [新增] 保存会话记忆
+function saveSession(sessionId, data) {
+    if (!sessionId) return;
+    try {
+        const safeId = sessionId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+
+        // 确保目录存在
+        if (!fs.existsSync(SESSION_ROOT)) {
+            fs.mkdirSync(SESSION_ROOT, { recursive: true });
+        }
+
+        const filePath = path.join(SESSION_ROOT, `${safeId}.json`);
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+    } catch (e) {
+        console.error(
+            `[Anima Session] Save failed for ${sessionId}: ${e.message}`,
+        );
+    }
+}
+
+// ✅ [修改版] 核心回响逻辑 (含日志增强 + 存储瘦身 + 前端日志返回)
+function processEchoLogic(
+    currentResults,
+    globalTop50,
+    lastMemories,
+    config = {},
+) {
+    const echoLogs = [];
+
+    const maxTotalLimit = config.max_count || 10;
+    const baseLife = config.base_life || 1;
+    const impLife = config.imp_life || 2;
+    const impTags = config.important_tags || ["important"];
+
+    // 🔥 修改点 1：log 函数增加 meta 参数
+    /**
+     * @param {string} msg
+     * @param {any} [meta] - 允许传入对象
+     */
+    const log = (msg, meta = null) => {
+        console.log(msg);
+        echoLogs.push({
+            step: "Echo System",
+            info: msg,
+            meta: meta,
+        });
+    };
+
+    // 头部日志没有 meta，保持原样
+    log(
+        `[Anima Echo] 🔍 开始回响判定 | 上轮记忆: ${Object.keys(lastMemories).length} | 本轮命中: ${currentResults.length} | 全局校验池: ${globalTop50.length}`,
+    );
+
+    const echoItems = [];
+    const nextMemories = {};
+    let remainingSlots = Math.max(0, maxTotalLimit - currentResults.length);
+    const currentIds = new Set(currentResults.map((r) => r.item.id));
+    const globalIds = new Set(globalTop50.map((r) => r.item.id));
+
+    // --- 1. 处理旧记忆 ---
+    Object.values(lastMemories).forEach((memory) => {
+        const memId = memory.item.id;
+        const indexStr = memory.item.metadata?.index || "unknown";
+        const metaData = {
+            score: memory.score || 0,
+            tags: memory.item.metadata?.tags || [],
+            index: indexStr,
+        };
+
+        // A. 自然命中 (Refreshed) - 满血复活
+        if (currentIds.has(memId)) {
+            const leanItem = { ...memory.item };
+            delete leanItem.vector;
+            nextMemories[memId] = {
+                ...memory,
+                life: memory.maxLife, // 重置为最大生命
+                item: leanItem,
+            };
+            log(
+                `[Anima Echo] ♻️ [刷新] Index ${indexStr} (自然命中) | Life重置: ${memory.maxLife}`,
+                metaData,
+            );
+            return;
+        }
+
+        // B & C & D. 尝试回响
+        if (globalIds.has(memId)) {
+            // 只要 Life > 0 或者是刚刚被复活的 (Life 1)，就有资格尝试回响
+            if (memory.life > 0) {
+                if (remainingSlots > 0) {
+                    // [C. 回响成功]
+                    const leanItem = { ...memory.item };
+                    delete leanItem.vector;
+                    echoItems.push({
+                        item: leanItem,
+                        score: memory.score || 0,
+                        _source_collection: memory.source || "memory",
+                        _is_echo: true,
+                    });
+                    remainingSlots--;
+                    const newLife = memory.life - 1;
+                    nextMemories[memId] = {
+                        ...memory,
+                        life: newLife,
+                        item: leanItem,
+                    };
+                    log(
+                        `[Anima Echo] 🔗 [回响成功] Index ${indexStr} | 剩余Life: ${newLife}`,
+                        metaData,
+                    );
+                } else {
+                    // [D. 惜败 (排队)]
+                    const newLife = memory.life - 1;
+
+                    // 🟢 [核心修改]：同样允许保存 0 Life
+                    nextMemories[memId] = {
+                        ...memory,
+                        life: newLife,
+                        item: { ...memory.item }, // 这里的item可能还带vector，建议也清理一下，不过不关键
+                    };
+
+                    log(
+                        `[Anima Echo] ⏳ [排队等待] Index ${indexStr} (无卡槽) | 剩余Life: ${newLife}`,
+                        metaData,
+                    );
+                }
+            } else {
+                // Life 本来就是 0 (且没被复活)，那就真的死了
+                log(
+                    `[Anima Echo] 💀 [记忆枯竭] Index ${indexStr} (Life耗尽 -> 删除)`,
+                    metaData,
+                );
+            }
+        } else {
+            // [B. 离题] - 直接移除，不进入 nextMemories
+            log(
+                `[Anima Echo] 💨 [遗忘] Index ${indexStr} (脱离相关性范围)`,
+                metaData,
+            );
+        }
+    });
+
+    // --- 2. 注册新记忆 ---
+    currentResults.forEach((res) => {
+        const resId = res.item.id;
+        const indexStr = res.item.metadata?.index || "unknown";
+
+        if (!nextMemories[resId]) {
+            const tags = res.item.metadata.tags || [];
+            const isImportant = tags.some((t) =>
+                impTags.includes(t.toLowerCase()),
+            );
+            const initialLife = isImportant ? impLife : baseLife;
+            const leanItem = { ...res.item };
+            delete leanItem.vector;
+
+            nextMemories[resId] = {
+                life: initialLife,
+                maxLife: initialLife,
+                item: leanItem,
+                score: res.score,
+                source: res._source_collection,
+            };
+
+            // 🔥 修改点 3：新记忆也要 meta
+            log(
+                `[Anima Echo] 🆕 [新增记忆] Index ${indexStr} | 初始Life: ${initialLife}`,
+                {
+                    score: res.score,
+                    tags: tags,
+                    index: indexStr,
+                },
+            );
+        }
+    });
+
+    return { echoItems, nextMemories, echoLogs };
 }
 
 // 辅助：获取向量
@@ -316,7 +520,7 @@ async function queryMultiIndices(
     allResults.sort((a, b) => b.score - a.score);
 
     // 截取
-    return allResults.slice(0, k);
+    return allResults.slice(0, 50);
 }
 
 // 🔥 新增：动态策略执行器 (2-1-2-N*M 完整逻辑 - 最终修复版)
@@ -324,6 +528,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
     let finalResults = [];
     let usedIds = new Set();
     let debugLogs = [];
+    let echoCandidatePool = [];
     const steps = config.steps || [];
     const multiplier = config.global_multiplier || 2;
     const globalMinScore = config.min_score || 0;
@@ -335,23 +540,12 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
     // =========================================================
     // 🔥 核心修改：动态构建“功能性标签池” (Functional Tags Pool)
     // =========================================================
-    // 目的：自动识别哪些标签是“功能性”的 (Important/Status/Period/Holiday)
-    // 剩下的那个自然就是 Vibe。这样就不需要在 UI 里配置 Vibe 列表了。
-
     let functionalTagsSet = new Set();
-
-    // 1. 强制添加 'important' 防止漏网
-    functionalTagsSet.add("important");
-
-    // 2. 遍历前端发来的 steps，把所有用到的特殊标签都加进去
     steps.forEach((s) => {
-        // 涵盖所有功能性步骤
         if (["important", "status", "period", "special"].includes(s.type)) {
-            // 收集 labels 数组 (例如 ["sick", "injury", "birthday"])
             if (s.labels && Array.isArray(s.labels)) {
                 s.labels.forEach((l) => functionalTagsSet.add(l.toLowerCase()));
             }
-            // 收集旧版 target_tag (兼容)
             if (s.target_tag) {
                 functionalTagsSet.add(s.target_tag.toLowerCase());
             }
@@ -366,13 +560,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
     // =========================================================
     // 🛠️ 辅助函数：构建合并过滤器
     // =========================================================
-    // 作用：将步骤特有的 Tag 过滤 和 全局的 ID 排除过滤 合并
     const buildFilter = (stepFilter = {}) => {
-        // 如果没有要排除的 ID，直接返回原 Filter
         if (!ignoreIds || ignoreIds.length === 0) return stepFilter;
-
-        // 如果有排除 ID，注入 { index: { $nin: [...] } }
-        // Vectra 支持多字段过滤 (AND 关系)
         return {
             ...stepFilter,
             index: { $nin: ignoreIds },
@@ -385,7 +574,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
     // 记录 Step 1 发现的风格 (用于 Step 6 排除)
     let detectedVibeTag = null;
-    // 记录 Step 2 使用的标签 (用于 Step 6 排除)
     let detectedImportantLabels = [];
 
     for (let i = 0; i < steps.length; i++) {
@@ -398,7 +586,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
         switch (step.type) {
             case "base":
-                stepCoeff = 1;
+                stepCoeff = 4;
                 break;
             case "important":
                 // 重要检索：极易重复，需要深挖 (例如: 全局2.0 * 2.5 = 5倍候选)
@@ -424,17 +612,16 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
         // [调试日志] 方便你观察实际用了多少倍率
         console.log(
-            `[Step ${i + 1} - ${step.type}] Count: ${step.count} | Multiplier: ${finalMultiplier.toFixed(1)}x | Candidates: ${candidateK}`,
+            `[Step ${i + 1} - ${step.type}] Count: ${step.count} | Multiplier: ${finalMultiplier.toFixed(1)}x | Candidates Per DB: ${candidateK}`,
         );
 
         let candidates = [];
         switch (step.type) {
             case "base":
-                // Step 1: 基础检索
                 candidates = await queryMultiIndices(
                     indices,
                     vector,
-                    candidateK,
+                    candidateK, // 这里是动态计算出来的 (e.g., 20)
                     buildFilter({}),
                     "Chat",
                 );
@@ -456,6 +643,18 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         );
                     }
                 }
+                candidates.sort((a, b) => b.score - a.score);
+
+                // 2. 截取全局 Top 50，存入我们定义的变量中
+                if (echoCandidatePool.length === 0) {
+                    echoCandidatePool = candidates.slice(0, 50);
+                    console.log(
+                        `[Anima Strategy] 🌊 已捕获 Base 全局池用于回响 (Top ${echoCandidatePool.length})`,
+                    );
+                }
+                // 注意：这里不需要手动 slice candidates 给后续逻辑
+                // 因为原本的逻辑下面有 `for (const res of candidates) { if (addedInStep >= limit) break; ... }`
+                // 它会自动只取 step.count (比如 5 个) 放入 finalResults
                 break;
 
             case "important":
@@ -629,7 +828,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         step.type,
                     )
                 ) {
-                    if (res.score < Math.max(0, globalMinScore - 0.1)) continue;
+                    if (res.score < Math.max(0, globalMinScore - 0.2)) continue;
                 } else {
                     continue;
                 }
@@ -676,6 +875,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
         return idA.slice - idB.slice;
     });
     finalResults["_debug_logs"] = debugLogs;
+    finalResults["_echo_pool"] = echoCandidatePool;
+
     return finalResults;
 }
 
@@ -697,6 +898,21 @@ async function init(router) {
             index,
             batch_id,
         } = req.body;
+
+        if (
+            !text ||
+            typeof text !== "string" ||
+            text.trim().length === 0 ||
+            text === "(条目已丢失)" // 🟢 拦截特定错误文本
+        ) {
+            console.warn(
+                `[Anima RAG] ⚠️ 拒绝写入无效文本 (Index: ${index}) Content: ${text}`,
+            );
+            return res.status(400).json({
+                success: false,
+                message: "Text content is invalid or missing.",
+            });
+        }
 
         // 🛡️ 安全处理 batch_id (这是修复的核心)
         // 如果前端传来的 batch_id 是 undefined 或 null，parseInt 会变成 NaN
@@ -1024,27 +1240,90 @@ async function init(router) {
     // ==========================================
     router.post("/query", async (req, res) => {
         try {
-            // 1. 获取基础参数
-            const { searchText, apiConfig, ignore_ids } = req.body;
+            // 1. 获取基础参数 (这里解构后，sessionId 就已经存在了)
+            const {
+                searchText,
+                apiConfig,
+                ignore_ids,
+                echoConfig,
+                sessionId,
+                is_swipe,
+            } = req.body;
 
-            // --- 兼容旧版参数 (防止前端还没改完时报错) ---
+            // --- 兼容旧版参数 ---
             const legacyCollectionIds = req.body.collectionIds;
             const legacyStrategy = req.body.strategy;
 
-            // --- 新版参数 (双轨制) ---
-            // 前端将传过来:
-            // chatContext: { ids: [], strategy: {} }
-            // kbContext:   { ids: [], strategy: {} }
+            // --- 新版参数 ---
             const chatContext = req.body.chatContext || {
                 ids: legacyCollectionIds,
                 strategy: legacyStrategy,
             };
             const kbContext = req.body.kbContext || { ids: [], strategy: null };
 
-            // 2. 向量化 (核心优化：只做一次 Embedding)
+            // 2. 向量化
             if (!searchText)
                 return res.json({ chat_results: [], kb_results: [] });
             const vector = await getEmbedding(searchText, apiConfig);
+
+            // ============================================================
+            // 🧠 [新增] 会话状态预处理 (GC vs Resurrection)
+            // ============================================================
+            // 🛠️ 修复点：初始化为对象 {} 而不是数组 []，避免类型冲突
+            let sessionData = { memories: {} };
+            let lastMemories = {};
+
+            if (sessionId) {
+                // 读取 Session
+                const loaded = loadSession(sessionId);
+                // 确保 memories 存在，且如果是数组(旧数据)要转为对象，如果是对象则直接用
+                if (Array.isArray(loaded.memories)) {
+                    // 兼容旧数据的兜底逻辑：把数组转为 ID Map
+                    loaded.memories.forEach((m) => {
+                        if (m && m.item && m.item.id)
+                            lastMemories[m.item.id] = m;
+                    });
+                } else {
+                    lastMemories = loaded.memories || {};
+                }
+
+                // --- 核心逻辑开始 ---
+                if (is_swipe) {
+                    // 🅰️ 【Swipe 模式】：亡者复苏
+                    let resurrectionCount = 0;
+                    for (const [key, mem] of Object.entries(lastMemories)) {
+                        if (mem.life <= 0) {
+                            mem.life = 1; // 临时复活
+                            resurrectionCount++;
+                        }
+                    }
+                    if (resurrectionCount > 0) {
+                        console.log(
+                            `[Anima Echo] 🔄 检测到 Swipe: 临时复活了 ${resurrectionCount} 条僵尸记忆`,
+                        );
+                    }
+                } else {
+                    // 🅱️ 【Normal 模式】：垃圾回收 (GC)
+                    const livingMemories = {};
+                    let gcCount = 0;
+                    for (const [key, mem] of Object.entries(lastMemories)) {
+                        if (mem.life > 0) {
+                            livingMemories[key] = mem;
+                        } else {
+                            gcCount++;
+                        }
+                    }
+                    if (gcCount > 0) {
+                        console.log(
+                            `[Anima Echo] 🧹 新对话开始: 清理了 ${gcCount} 条已枯竭的记忆`,
+                        );
+                        lastMemories = livingMemories;
+                    }
+                }
+
+                // 🛠️ 修复点：赋值回 sessionData，此时类型匹配了 (都是对象)
+                sessionData.memories = lastMemories;
+            }
 
             // 3. 定义并行任务
             const tasks = [];
@@ -1056,7 +1335,6 @@ async function init(router) {
                     : [];
                 if (targetIds.length === 0) return [];
 
-                // 1. 加载索引 (这里没变)
                 const rawIndices = (
                     await Promise.all(
                         targetIds.map((id) =>
@@ -1065,29 +1343,23 @@ async function init(router) {
                     )
                 ).filter((i) => i !== null);
 
-                // 🔥 [修改点]：去重逻辑
-                // 利用 Set 去除重复的对象引用 (即同一个内存地址的 Index 实例)
                 const uniqueIndices = [...new Set(rawIndices)];
-
-                // 如果去重后为空，直接返回
                 if (uniqueIndices.length === 0) return [];
 
-                // 2. 执行策略
                 const safeIgnoreIds = Array.isArray(ignore_ids)
                     ? ignore_ids
                     : [];
                 const strat = chatContext.strategy;
 
                 if (strat && strat.enabled) {
-                    // 复杂策略：这里把原来的 indices 改成 uniqueIndices
                     return await performDynamicStrategy(
-                        uniqueIndices, // <--- 修改了这里
+                        uniqueIndices,
                         vector,
                         strat,
                         safeIgnoreIds,
                     );
                 } else {
-                    // 简单模式：这里也把 indices 改成 uniqueIndices
+                    // 简单模式
                     const simpleCount =
                         strat?.steps?.find((s) => s.type === "base")?.count ||
                         5;
@@ -1098,12 +1370,19 @@ async function init(router) {
                             : null;
 
                     let raw = await queryMultiIndices(
-                        uniqueIndices, // <--- 修改了这里
+                        uniqueIndices,
                         vector,
                         simpleCount * 1.5,
                         simpleFilter,
+                        "SimpleChat",
                     );
-
+                    raw["_debug_logs"] = raw["_debug_logs"] || [];
+                    raw["_debug_logs"].push({
+                        step: "Base",
+                        library: "Simple",
+                        score: 0,
+                        tags: "No Strategy",
+                    });
                     raw = raw
                         .filter((r) => r.score >= minScore)
                         .slice(0, simpleCount);
@@ -1128,7 +1407,6 @@ async function init(router) {
                     : [];
                 if (targetIds.length === 0) return [];
 
-                // 1. 加载索引
                 const rawIndices = (
                     await Promise.all(
                         targetIds.map((id) =>
@@ -1137,14 +1415,10 @@ async function init(router) {
                     )
                 ).filter((i) => i !== null);
 
-                // 🛡️ 安全去重 (和 Chat 逻辑保持一致)
                 const uniqueIndices = [...new Set(rawIndices)];
-
                 if (uniqueIndices.length === 0) return [];
 
                 const strat = kbContext.strategy || { min_score: 0.5 };
-
-                // 获取用户设置的 N (search_top_k)
                 const simpleCount = strat.search_top_k || 3;
                 const minScore = strat.min_score || 0.5;
 
@@ -1155,12 +1429,11 @@ async function init(router) {
                 let raw = await queryMultiIndices(
                     uniqueIndices,
                     vector,
-                    simpleCount, // <--- 🔥 修改了这里，去掉了 * 2
+                    simpleCount,
                     null,
                     "KB",
                 );
 
-                // 3. 最终过滤
                 raw = raw
                     .filter((r) => r.score >= minScore)
                     .slice(0, simpleCount);
@@ -1171,11 +1444,164 @@ async function init(router) {
 
             // 4. 并行等待结果
             const [chatRaw, kbRaw] = await Promise.all(tasks);
+            const collectedLogs =
+                chatRaw && chatRaw["_debug_logs"] ? chatRaw["_debug_logs"] : [];
+            // ============================================================
+            // 🧠 [新增] 回响机制集成 (Echo Mechanism Integration)
+            // ============================================================
+            let finalChatResults = chatRaw || [];
 
-            // 5. 格式化输出函数
+            if (sessionId && chatContext.ids && chatContext.ids.length > 0) {
+                try {
+                    console.log(
+                        `[Anima Echo] 🧠 启动回响处理... Session: ${sessionId}`,
+                    );
+
+                    // 🛠️ 修复点：直接使用预处理好的 lastMemories (含复活/GC后的状态)
+                    // 不要再调用 loadSession 了
+
+                    // 获取全局校验池
+                    /* 
+                    const targetIds = chatContext.ids.filter((id) => id);
+                    const rawIndices = await Promise.all(
+                        targetIds.map((id) =>
+                            getIndex(id, false).catch(() => null),
+                        ),
+                    );
+                    const uniqueIndices = [...new Set(rawIndices)].filter(
+                        (i) => i !== null,
+                    );
+
+                    const globalTop50 = await queryMultiIndices(
+                        uniqueIndices,
+                        vector,
+                        50,
+                        null,
+                        "EchoValidator",
+                    );
+                    */
+                    const globalTop50 = chatRaw["_echo_pool"] || [];
+
+                    console.log(
+                        `[Anima Echo] ♻️ 复用 Base 检索池: ${globalTop50.length} 条候选`,
+                    );
+
+                    // 3. 执行回响逻辑
+                    // 💡 这里我们硬编码 MaxLimit = 10，或者你可以从 req.body 读一个配置
+                    // 假设用户希望总切片数维持在 10 个左右 (包括正常检索的 + 回响的)
+                    let dynamicImpTags = ["important"]; // 默认兜底
+
+                    if (
+                        chatContext.strategy &&
+                        chatContext.strategy.important &&
+                        Array.isArray(chatContext.strategy.important.labels)
+                    ) {
+                        dynamicImpTags =
+                            chatContext.strategy.important.labels.map((t) =>
+                                t.toLowerCase(),
+                            );
+                        console.log(
+                            `[Anima Echo] 🎯 动态重要标签: ${dynamicImpTags.join(", ")}`,
+                        );
+                    }
+
+                    // 合并配置
+                    const finalEchoConfig = {
+                        ...(echoConfig || {}),
+                        important_tags: dynamicImpTags,
+                    };
+
+                    const { echoItems, nextMemories, echoLogs } =
+                        processEchoLogic(
+                            finalChatResults,
+                            globalTop50,
+                            lastMemories, // ✅ 传入
+                            finalEchoConfig,
+                        );
+
+                    // 🟢 将回响日志注入到 finalChatResults 的调试日志中
+                    if (echoLogs && echoLogs.length > 0) {
+                        const formattedEchoLogs = echoLogs.map((l) => {
+                            const hasMeta =
+                                l.meta && typeof l.meta === "object";
+                            let displayTags = l.info;
+                            if (
+                                hasMeta &&
+                                Array.isArray(l.meta.tags) &&
+                                l.meta.tags.length > 0
+                            ) {
+                                displayTags = `${l.info} 🏷️[${l.meta.tags.join(", ")}]`;
+                            }
+                            return {
+                                step: "Echo",
+                                library: "Memory",
+                                uniqueID: hasMeta ? l.meta.index : "-",
+                                tags: displayTags,
+                                score: hasMeta ? l.meta.score : 0,
+                            };
+                        });
+                        collectedLogs.push(...formattedEchoLogs);
+                    }
+
+                    // 4. 合并结果
+                    if (echoItems.length > 0) {
+                        console.log(
+                            `[Anima Echo] 🔗 成功回响插入 ${echoItems.length} 个旧记忆`,
+                        );
+                        finalChatResults = [...finalChatResults, ...echoItems];
+                    }
+
+                    saveSession(sessionId, {
+                        lastUpdated: Date.now(),
+                        memories: nextMemories,
+                    });
+                } catch (echoErr) {
+                    console.error(
+                        `[Anima Echo] ❌ 回响处理失败 (不影响主流程):`,
+                        echoErr,
+                    );
+                }
+            } else {
+                console.log(
+                    `[Anima Echo] ⚠️ 跳过回响 (无 SessionID 或 结果为空)`,
+                );
+            }
+
+            if (finalChatResults.length > 0) {
+                finalChatResults.sort((a, b) => {
+                    const itemA = a.item.metadata;
+                    const itemB = b.item.metadata;
+
+                    // 1. Timestamp
+                    const timeA = new Date(itemA.timestamp || 0).getTime();
+                    const timeB = new Date(itemB.timestamp || 0).getTime();
+                    if (timeA > 0 && timeB > 0 && timeA !== timeB) {
+                        return timeA - timeB;
+                    }
+
+                    // 2. Index (Batch_Slice)
+                    const parseId = (str) => {
+                        const parts = (str || "0_0").split("_");
+                        return {
+                            batch: parseInt(parts[0] || 0),
+                            slice: parseInt(parts[1] || 0),
+                        };
+                    };
+
+                    const idA = parseId(itemA.index);
+                    const idB = parseId(itemB.index);
+
+                    if (idA.batch !== idB.batch) {
+                        return idA.batch - idB.batch;
+                    }
+                    return idA.slice - idB.slice;
+                });
+            }
+
+            // 6. 格式化输出函数
             const formatResults = (rawList) => {
                 if (!rawList) return [];
-                const formatted = rawList.map((r) => ({
+                return rawList.map((r) => ({
                     text: r.item.metadata.text,
                     tags: r.item.metadata.tags,
                     score: r.score,
@@ -1183,21 +1609,17 @@ async function init(router) {
                     index: r.item.metadata.index,
                     batch_id: r.item.metadata.batch_id,
                     source: r["_source_collection"] || "unknown",
-                    // 知识库特有字段
                     doc_name: r.item.metadata.doc_name,
+                    is_echo: r._is_echo || r.is_echo || false,
                 }));
-                // 如果有 debug 日志，挂载到结果数组对象上 (JS数组也是对象)
-                if (rawList["_debug_logs"])
-                    formatted["_debug_logs"] = rawList["_debug_logs"];
-                return formatted;
             };
+            const executionLogs = finalChatResults["_debug_logs"] || [];
 
-            // 6. 返回合并对象
+            // 7. 返回合并对象
             res.json({
-                chat_results: formatResults(chatRaw),
+                chat_results: formatResults(finalChatResults),
                 kb_results: formatResults(kbRaw),
-                // 兼容旧版：如果前端还在期待根数组，返回 chat_results
-                ...formatResults(chatRaw), // 这一点点 hack 可以让旧前端代码 res.data.map 依然能运行（只拿到 chat 结果）
+                _debug_logs: collectedLogs,
             });
         } catch (err) {
             console.error(err);
