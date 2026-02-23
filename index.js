@@ -190,12 +190,25 @@ function processEchoLogic(
     const currentIds = new Set(currentResults.map((r) => r.item.id));
     const globalIds = new Set(globalTop50.map((r) => r.item.id));
 
+    const freshScoreMap = new Map();
+    currentResults.forEach((r) => freshScoreMap.set(r.item.id, r.score));
+    globalTop50.forEach((r) => {
+        if (!freshScoreMap.has(r.item.id))
+            freshScoreMap.set(r.item.id, r.score);
+    });
+
     // --- 1. 处理旧记忆 ---
     Object.values(lastMemories).forEach((memory) => {
         const memId = memory.item.id;
         const indexStr = memory.item.metadata?.index || "unknown";
+
+        // 🟢 [核心修改]：优先从地图里拿最新分数，没有才用上一轮的旧分数
+        const currentScore = freshScoreMap.has(memId)
+            ? freshScoreMap.get(memId)
+            : memory.score || 0;
+
         const metaData = {
-            score: memory.score || 0,
+            score: currentScore, // ✅ 使用最新分数展示
             tags: memory.item.metadata?.tags || [],
             index: indexStr,
         };
@@ -206,8 +219,9 @@ function processEchoLogic(
             delete leanItem.vector;
             nextMemories[memId] = {
                 ...memory,
-                life: memory.maxLife, // 重置为最大生命
+                life: memory.maxLife,
                 item: leanItem,
+                score: currentScore, // ✅ 同步更新保存的最新分数，防止存入旧数据
             };
             log(
                 `[Anima Echo] ♻️ [刷新] Index ${indexStr} (自然命中) | Life重置: ${memory.maxLife}`,
@@ -226,7 +240,7 @@ function processEchoLogic(
                     delete leanItem.vector;
                     echoItems.push({
                         item: leanItem,
-                        score: memory.score || 0,
+                        score: currentScore, // 🟢 [修改 1] 这里原本是 memory.score || 0，改为最新分数
                         _source_collection: memory.source || "memory",
                         _is_echo: true,
                     });
@@ -236,20 +250,20 @@ function processEchoLogic(
                         ...memory,
                         life: newLife,
                         item: leanItem,
+                        score: currentScore, // 🟢 [修改 2] 顺手确保下一次存入本地的也是最新分数
                     };
                     log(
                         `[Anima Echo] 🔗 [回响成功] Index ${indexStr} | 剩余Life: ${newLife}`,
-                        metaData,
+                        metaData, // 这里的 metaData 已经是最新分数了，所以你的浏览器控制台是对的
                     );
                 } else {
                     // [D. 惜败 (排队)]
                     const newLife = memory.life - 1;
-
-                    // 🟢 [核心修改]：同样允许保存 0 Life
                     nextMemories[memId] = {
                         ...memory,
                         life: newLife,
-                        item: { ...memory.item }, // 这里的item可能还带vector，建议也清理一下，不过不关键
+                        item: { ...memory.item },
+                        score: currentScore, // 🟢 [修改 3] 排队的记忆也要更新成最新分数
                     };
 
                     log(
@@ -492,6 +506,8 @@ async function queryMultiIndices(
     k,
     filter = null,
     taskTag = "RAG",
+    recentWeight = 0,
+    currentSessionId = null,
 ) {
     console.log(
         `[Anima Debug] [${taskTag}] 🚀 并行检索 ${indices.length} 个库...`,
@@ -504,6 +520,24 @@ async function queryMultiIndices(
         // 🔥 [修改这里] 为每个结果附带来源库的 ID
         return results.map((res) => {
             res._source_collection = idx._debug_id || "unknown_lib";
+
+            // 🟢 [新增核心逻辑] 近因加权：只对当前数据库的分数进行提升
+            if (
+                recentWeight > 0 &&
+                currentSessionId &&
+                res._source_collection === currentSessionId
+            ) {
+                const oldScore = res.score; // 记录原始分数
+                res.score += Number(recentWeight);
+                res._is_weighted = true; // 打上标记，供前端日志读取
+
+                // 打印后端加权日志
+                const indexStr = res.item.metadata?.index || "unknown";
+                console.log(
+                    `[Anima 加权] ⬆️ Index ${indexStr} | 分数: ${oldScore.toFixed(4)} -> ${res.score.toFixed(4)} (+${recentWeight})`,
+                );
+            }
+
             return res;
         });
     });
@@ -532,7 +566,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
     const steps = config.steps || [];
     const multiplier = config.global_multiplier || 2;
     const globalMinScore = config.min_score || 0;
-
+    const recentWeight = config.recent_weight || 0;
+    const currentSessionId = config.current_session_id || null;
     console.log(
         `[Anima RAG] 🚀 执行策略 | 步骤数: ${steps.length} | 排除ID: ${ignoreIds.length} 个`,
     );
@@ -624,6 +659,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     candidateK, // 这里是动态计算出来的 (e.g., 20)
                     buildFilter({}),
                     "Chat",
+                    recentWeight,
+                    currentSessionId,
                 );
 
                 // 🕵️ 智能捕获 Vibe Tag (排除法)
@@ -668,6 +705,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
                             "Chat",
+                            recentWeight,
+                            currentSessionId,
                         ),
                     );
                     const impResults = await Promise.all(impPromises);
@@ -695,6 +734,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
                             "Chat",
+                            recentWeight,
+                            currentSessionId,
                         ),
                     );
                     const statusResults = await Promise.all(statusPromises);
@@ -725,6 +766,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         candidateK,
                         buildFilter({ tags: { $in: step.labels } }), // <--- 修改点
                         "Chat",
+                        recentWeight,
+                        currentSessionId,
                     );
                 }
                 break;
@@ -740,6 +783,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
                             "Chat",
+                            recentWeight,
+                            currentSessionId,
                         ),
                     );
                     const specialResults = await Promise.all(specialPromises);
@@ -762,6 +807,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         candidateK,
                         buildFilter({ tags: { $in: [step.target_tag] } }),
                         "Chat",
+                        recentWeight,
+                        currentSessionId,
                     );
                 }
                 break;
@@ -780,6 +827,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         candidateK,
                         buildFilter({ tags: { $nin: excludeTags } }), // <--- 修改点
                         "Chat",
+                        recentWeight,
+                        currentSessionId,
                     );
                 } else {
                     candidates = await queryMultiIndices(
@@ -787,6 +836,9 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         vector,
                         candidateK,
                         buildFilter({}),
+                        "Chat",
+                        recentWeight,
+                        currentSessionId,
                     );
                 }
                 break;
@@ -796,11 +848,14 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
             candidates.forEach((c) => {
                 // 记录每一条候选项的来源信息
                 debugLogs.push({
-                    step: `Step ${i + 1}: ${step.type.toUpperCase()}`, // 步骤名
-                    library: c._source_collection, // 来源库 (我们在上一步改出来的)
-                    uniqueID: c.item.metadata.index, // 片段ID
-                    tags: (c.item.metadata.tags || []).join(", "), // Tags
-                    score: c.score.toFixed(4), // 分数
+                    step: `Step ${i + 1}: ${step.type.toUpperCase()}`,
+                    library: c._source_collection,
+                    uniqueID: c.item.metadata.index,
+                    tags: (c.item.metadata.tags || []).join(", "),
+                    // 🟢 [修改这里] 如果被加权过，在浏览器日志里加个 ⬆️ 箭头提示
+                    score: c._is_weighted
+                        ? `${c.score.toFixed(4)} (⬆️+${recentWeight})`
+                        : c.score.toFixed(4),
                 });
             });
         }
@@ -922,6 +977,18 @@ async function init(router) {
             safeBatchId = -1;
         }
 
+        let safeTimestamp = Number(timestamp);
+        if (isNaN(safeTimestamp) || safeTimestamp <= 0) {
+            // 如果传来的是 ISO 字符串，转为数字
+            if (typeof timestamp === "string") {
+                safeTimestamp = new Date(timestamp).getTime();
+            }
+            // 如果还是无效（比如 null/undefined），使用当前时间兜底
+            if (isNaN(safeTimestamp) || safeTimestamp <= 0) {
+                safeTimestamp = Date.now();
+            }
+        }
+
         try {
             await runInQueue(collectionId, async () => {
                 const vector = await getEmbedding(text, apiConfig);
@@ -986,7 +1053,7 @@ async function init(router) {
                     metadata: {
                         text,
                         tags,
-                        timestamp,
+                        timestamp: safeTimestamp,
                         index,
                         // ✅ 这里使用处理过的 safeBatchId，而不是原始的 parseInt(batch_id)
                         batch_id: safeBatchId,
@@ -1369,12 +1436,18 @@ async function init(router) {
                             ? { index: { $nin: safeIgnoreIds } }
                             : null;
 
+                    // 🟢 [新增] 获取参数
+                    const recentWeight = strat?.recent_weight || 0;
+                    const currentSessionId = strat?.current_session_id || null;
+
                     let raw = await queryMultiIndices(
                         uniqueIndices,
                         vector,
                         simpleCount * 1.5,
                         simpleFilter,
                         "SimpleChat",
+                        recentWeight, // 🟢 [新增透传]
+                        currentSessionId, // 🟢 [新增透传]
                     );
                     raw["_debug_logs"] = raw["_debug_logs"] || [];
                     raw["_debug_logs"].push({
