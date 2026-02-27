@@ -785,14 +785,38 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
             case "period":
                 // Step 4: 生理检索
                 if (step.labels && step.labels.length > 0) {
-                    candidates = await queryMultiIndices(
-                        indices,
-                        vector,
-                        candidateK,
-                        buildFilter({ tags: { $in: step.labels } }), // <--- 修改点
-                        "Chat",
-                        recentWeight,
-                        currentSessionId,
+                    const periodPromises = step.labels.map((label) =>
+                        queryMultiIndices(
+                            indices,
+                            vector,
+                            candidateK,
+                            buildFilter({ tags: { $in: [label] } }),
+                            "Chat",
+                            recentWeight,
+                            currentSessionId,
+                        ),
+                    );
+                    const periodResults = await Promise.all(periodPromises);
+
+                    candidates = [];
+                    const tempUsedIds = new Set(usedIds);
+                    const stepThreshold = Math.max(0, globalMinScore - 0.2);
+
+                    periodResults.forEach((list) => {
+                        list.sort((a, b) => b.score - a.score);
+                        let countForThisLabel = 0;
+                        for (const res of list) {
+                            if (countForThisLabel >= step.count) break;
+                            if (tempUsedIds.has(res.item.id)) continue;
+                            if (res.score < stepThreshold) continue;
+
+                            candidates.push(res);
+                            tempUsedIds.add(res.item.id);
+                            countForThisLabel++;
+                        }
+                    });
+                    console.log(
+                        `   [Period] 生理分支检索: 触发 ${step.labels.join(", ")}`,
                     );
                 }
                 break;
@@ -886,7 +910,8 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
 
         // 计算这一步允许的最大数量 (Status步骤如果有多路，允许总量增加)
         const limit =
-            step.type === "status" && step.labels
+            ["status", "important", "special", "period"].includes(step.type) &&
+            step.labels
                 ? step.count * step.labels.length
                 : step.count;
 
