@@ -160,7 +160,7 @@ function processEchoLogic(
 ) {
     const echoLogs = [];
 
-    const maxTotalLimit = config.max_count || 10;
+    const maxTotalLimit = config.max_count ?? 10;
     const baseLife = config.base_life || 1;
     const impLife = config.imp_life || 2;
     const impTags = config.important_tags || ["important"];
@@ -711,13 +711,23 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     );
                     const impResults = await Promise.all(impPromises);
 
-                    // 强制均衡：确保每个标签都贡献 step.count 个结果
-                    const balancedResults = impResults.map((list) => {
-                        list.sort((a, b) => b.score - a.score);
-                        return list; // ✅ 改为直接返回完整列表
-                    });
+                    candidates = [];
+                    const tempUsedIds = new Set(usedIds);
+                    const stepThreshold = Math.max(0, globalMinScore - 0.2);
 
-                    candidates = balancedResults.flat();
+                    impResults.forEach((list) => {
+                        list.sort((a, b) => b.score - a.score);
+                        let countForThisLabel = 0;
+                        for (const res of list) {
+                            if (countForThisLabel >= step.count) break;
+                            if (tempUsedIds.has(res.item.id)) continue;
+                            if (res.score < stepThreshold) continue;
+
+                            candidates.push(res);
+                            tempUsedIds.add(res.item.id);
+                            countForThisLabel++;
+                        }
+                    });
                     console.log(
                         `   [Important] 分路检索: 触发 ${step.labels.join(", ")}`,
                     );
@@ -744,13 +754,28 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     // 如果 step.count 是 1，我们要确保每个标签都贡献 1 条，
                     // 而不是把所有结果混在一起按分数排序（那样可能会导致高分标签挤掉低分标签）。
                     // 所以我们在合并前，先对每个结果集进行截断。
-                    const balancedResults = statusResults.map((list) => {
+                    candidates = [];
+                    const tempUsedIds = new Set(usedIds); // 继承已使用的ID，防止与前面的 Base 步骤重复，也防止标签间互相抢切片
+                    const stepThreshold = Math.max(0, globalMinScore - 0.2); // 提前计算该步骤的豁免阈值
+
+                    statusResults.forEach((list) => {
+                        // 1. 对当前单个标签（如“生病”）的所有候选切片按分数从高到低排序
                         list.sort((a, b) => b.score - a.score);
-                        // ❌ 删除这行: return list.slice(0, step.count);
-                        return list; // ✅
+
+                        let countForThisLabel = 0;
+
+                        // 2. 独立向下筛选
+                        for (const res of list) {
+                            if (countForThisLabel >= step.count) break; // 当前标签名额已满，停止寻找
+                            if (tempUsedIds.has(res.item.id)) continue; // 已经被前面步骤或其他标签选用了，跳过
+                            if (res.score < stepThreshold) continue; // 分数不达标，跳过
+
+                            candidates.push(res);
+                            tempUsedIds.add(res.item.id); // 登记占用，防止被下一个标签（如“受伤”）重复选用
+                            countForThisLabel++;
+                        }
                     });
 
-                    candidates = balancedResults.flat();
                     console.log(
                         `   [Status] 分支检索: 触发 ${step.labels.join(", ")} (均衡模式)`,
                     );
@@ -773,8 +798,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                 break;
 
             case "special":
-                // Step 5: 节日检索 (修改版：支持多节日分路)
-                // 前端现在会传 labels: ["Birthday", "Christmas"]
+                // Step 5: 节日检索
                 if (step.labels && step.labels.length > 0) {
                     const specialPromises = step.labels.map((label) =>
                         queryMultiIndices(
@@ -789,17 +813,28 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     );
                     const specialResults = await Promise.all(specialPromises);
 
-                    const balancedResults = specialResults.map((list) => {
-                        list.sort((a, b) => b.score - a.score);
-                        return list; // ✅
-                    });
+                    candidates = [];
+                    const tempUsedIds = new Set(usedIds);
+                    const stepThreshold = Math.max(0, globalMinScore - 0.2);
 
-                    candidates = balancedResults.flat();
+                    specialResults.forEach((list) => {
+                        list.sort((a, b) => b.score - a.score);
+                        let countForThisLabel = 0;
+                        for (const res of list) {
+                            if (countForThisLabel >= step.count) break;
+                            if (tempUsedIds.has(res.item.id)) continue;
+                            if (res.score < stepThreshold) continue;
+
+                            candidates.push(res);
+                            tempUsedIds.add(res.item.id);
+                            countForThisLabel++;
+                        }
+                    });
                     console.log(
                         `   [Special] 节日触发: ${step.labels.join(", ")}`,
                     );
                 }
-                // 兼容旧逻辑 (防止前端没更新导致报错)
+                // 兼容旧逻辑
                 else if (step.target_tag) {
                     candidates = await queryMultiIndices(
                         indices,
@@ -844,22 +879,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                 break;
         }
 
-        if (candidates.length > 0) {
-            candidates.forEach((c) => {
-                // 记录每一条候选项的来源信息
-                debugLogs.push({
-                    step: `Step ${i + 1}: ${step.type.toUpperCase()}`,
-                    library: c._source_collection,
-                    uniqueID: c.item.metadata.index,
-                    tags: (c.item.metadata.tags || []).join(", "),
-                    // 🟢 [修改这里] 如果被加权过，在浏览器日志里加个 ⬆️ 箭头提示
-                    score: c._is_weighted
-                        ? `${c.score.toFixed(4)} (⬆️+${recentWeight})`
-                        : c.score.toFixed(4),
-                });
-            });
-        }
-
         // === 聚合结果 (去重 & 阈值) ===
         let addedInStep = 0;
         // 如果是 Status Fan-out，candidates 可能很多，先排序
@@ -892,6 +911,15 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
             finalResults.push(res);
             usedIds.add(res.item.id);
             addedInStep++;
+            debugLogs.push({
+                step: `Step ${i + 1}: ${step.type.toUpperCase()}`,
+                library: res._source_collection,
+                uniqueID: res.item.metadata.index,
+                tags: (res.item.metadata.tags || []).join(", "),
+                score: res._is_weighted
+                    ? `${res.score.toFixed(4)} (⬆️+${recentWeight})`
+                    : res.score.toFixed(4),
+            });
         }
     }
 
