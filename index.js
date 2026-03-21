@@ -2175,7 +2175,14 @@ async function init(router) {
                 const rawIndices = (
                     await Promise.all(
                         targetIds.map((id) =>
-                            getIndex(id, false).catch(() => null),
+                            getIndex(id, false).catch((e) => {
+                                // 🚨 抓捕幽灵报错：把底层的崩溃原因打印出来
+                                console.error(
+                                    `[Anima 致命抓捕] 加载库 ${id} 时底层崩溃:`,
+                                    e,
+                                );
+                                return null;
+                            }),
                         ),
                     )
                 ).filter((i) => i !== null);
