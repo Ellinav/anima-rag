@@ -23,6 +23,7 @@ const path = require("path");
 const fs = require("fs");
 const { LocalIndex } = require("vectra");
 const AdmZip = require("adm-zip");
+const bm25Engine = require("./bm25_engine");
 
 const VECTOR_ROOT = path.join(__dirname, "vectors");
 const SESSION_ROOT = path.join(__dirname, "data", "sessions");
@@ -224,7 +225,7 @@ function processEchoLogic(
                 score: currentScore, // ✅ 同步更新保存的最新分数，防止存入旧数据
             };
             log(
-                `[Anima Echo] ♻️ [刷新] Index ${indexStr} (自然命中) | Life重置: ${memory.maxLife}`,
+                `[Anima Echo] ♻️ [刷新] [📦 ${memory.source}] Index ${indexStr} (自然命中) | Life: ${memory.maxLife}`,
                 metaData,
             );
             return;
@@ -253,8 +254,8 @@ function processEchoLogic(
                         score: currentScore, // 🟢 [修改 2] 顺手确保下一次存入本地的也是最新分数
                     };
                     log(
-                        `[Anima Echo] 🔗 [回响成功] Index ${indexStr} | 剩余Life: ${newLife}`,
-                        metaData, // 这里的 metaData 已经是最新分数了，所以你的浏览器控制台是对的
+                        `[Anima Echo] 🔗 [回响成功] [📦 ${memory.source}] Index ${indexStr} | 剩余Life: ${newLife}`,
+                        metaData,
                     );
                 } else {
                     // [D. 惜败 (排队)]
@@ -267,21 +268,21 @@ function processEchoLogic(
                     };
 
                     log(
-                        `[Anima Echo] ⏳ [排队等待] Index ${indexStr} (无卡槽) | 剩余Life: ${newLife}`,
+                        `[Anima Echo] ⏳ [排队等待] [📦 ${memory.source}] Index ${indexStr} (无卡槽) | 剩余Life: ${newLife}`,
                         metaData,
                     );
                 }
             } else {
                 // Life 本来就是 0 (且没被复活)，那就真的死了
                 log(
-                    `[Anima Echo] 💀 [记忆枯竭] Index ${indexStr} (Life耗尽 -> 删除)`,
+                    `[Anima Echo] 💀 [记忆枯竭] [📦 ${memory.source}] Index ${indexStr} (Life耗尽 -> 删除)`,
                     metaData,
                 );
             }
         } else {
             // [B. 离题] - 直接移除，不进入 nextMemories
             log(
-                `[Anima Echo] 💨 [遗忘] Index ${indexStr} (脱离相关性范围)`,
+                `[Anima Echo] 💨 [遗忘] [📦 ${memory.source}] Index ${indexStr} (脱离相关性范围)`,
                 metaData,
             );
         }
@@ -580,10 +581,10 @@ async function queryMultiIndices(
                 res.score += Number(recentWeight);
                 res._is_weighted = true; // 打上标记，供前端日志读取
 
-                // 打印后端加权日志
+                // 🟢 [优化] 打印后端加权日志，带上步骤和来源数据库
                 const indexStr = res.item.metadata?.index || "unknown";
                 console.log(
-                    `[Anima 加权] ⬆️ Index ${indexStr} | 分数: ${oldScore.toFixed(4)} -> ${res.score.toFixed(4)} (+${recentWeight})`,
+                    `[Anima 加权] [${taskTag}] 📦 ${res._source_collection} | ⬆️ Index ${indexStr} | 分数: ${oldScore.toFixed(4)} -> ${res.score.toFixed(4)} (+${recentWeight})`,
                 );
             }
 
@@ -623,7 +624,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
     const rerankConfig = config.rerankConfig || {};
 
     console.log(
-        `[Anima RAG] 🚀 执行策略 | 步骤数: ${steps.length} | 排除ID: ${ignoreIds.length} 个`,
+        `[Anima RAG] 🚀 执行策略 | 步骤数: ${steps.length} | 排除ID: ${ignoreIds.length} 个 [${ignoreIds.join(", ")}]`,
     );
 
     // =========================================================
@@ -668,6 +669,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                 for (const res of basePool) {
                     if (added >= baseStepConfig.count) break;
                     if (usedIds.has(res.item.id)) continue;
+                    if (res.score < globalMinScore) continue;
                     finalResults.push(res);
                     usedIds.add(res.item.id);
                     added++;
@@ -689,11 +691,10 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     for (const res of importantPool) {
                         if (countForThisLabel >= importantStepConfig.count)
                             break;
-                        if (
-                            usedIds.has(res.item.id) ||
-                            res.score < stepThreshold
-                        )
-                            continue;
+                        if (usedIds.has(res.item.id)) continue;
+
+                        // 🔒 仅在未重排时，Important 遵守降分门槛
+                        if (res.score < stepThreshold) continue;
 
                         const tags = (res.item.metadata.tags || []).map((t) =>
                             t.toLowerCase(),
@@ -882,7 +883,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     vector,
                     candidateK,
                     buildFilter({}),
-                    "Chat",
+                    "Step: BASE",
                     recentWeight,
                     currentSessionId,
                 );
@@ -921,7 +922,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             vector,
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
-                            "Chat",
+                            "Step: IMPORTANT",
                             recentWeight,
                             currentSessionId,
                         ),
@@ -931,19 +932,23 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                     // 👇 完全恢复你的分路均衡逻辑，确保每个标签都能公平地进入重排池
                     let tempCandidates = [];
                     const tempUsedIds = new Set(usedIds);
-                    const stepThreshold = Math.max(0, globalMinScore - 0.2);
+                    const isRerankActive =
+                        rerankConfig.enabled && rerankConfig.api && searchText;
+                    const stepThreshold = isRerankActive
+                        ? -999
+                        : Math.max(0, globalMinScore - 0.2);
 
                     impResults.forEach((list) => {
                         list.sort((a, b) => b.score - a.score);
                         let countForThisLabel = 0;
 
-                        // 💡 唯一小改动：为了让重排模型有得选，这里提取的数量比原本的 step.count 多一点（比如乘以3，最少取5个）
-                        // 最终在结算阶段（executeRerankFlush），依然会严格按照 step.count 截取
                         const poolLimitForLabel = Math.max(step.count * 3, 5);
 
                         for (const res of list) {
                             if (countForThisLabel >= poolLimitForLabel) break;
                             if (tempUsedIds.has(res.item.id)) continue;
+
+                            // 这里会自动根据 isRerankActive 决定是否卡分数
                             if (res.score < stepThreshold) continue;
 
                             tempCandidates.push(res);
@@ -967,7 +972,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             vector,
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
-                            "Chat",
+                            "Step: STATUS",
                             recentWeight,
                             currentSessionId,
                         ),
@@ -984,8 +989,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         for (const res of list) {
                             if (countForThisLabel >= step.count) break;
                             if (tempUsedIds.has(res.item.id)) continue;
-                            if (res.score < stepThreshold) continue;
-
                             candidates.push(res);
                             tempUsedIds.add(res.item.id);
                             countForThisLabel++;
@@ -1002,7 +1005,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             vector,
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
-                            "Chat",
+                            "Step: PERIOD",
                             recentWeight,
                             currentSessionId,
                         ),
@@ -1019,8 +1022,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         for (const res of list) {
                             if (countForThisLabel >= step.count) break;
                             if (tempUsedIds.has(res.item.id)) continue;
-                            if (res.score < stepThreshold) continue;
-
                             candidates.push(res);
                             tempUsedIds.add(res.item.id);
                             countForThisLabel++;
@@ -1040,7 +1041,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                             vector,
                             candidateK,
                             buildFilter({ tags: { $in: [label] } }),
-                            "Chat",
+                            "Step: SPECIAL",
                             recentWeight,
                             currentSessionId,
                         ),
@@ -1057,8 +1058,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         for (const res of list) {
                             if (countForThisLabel >= step.count) break;
                             if (tempUsedIds.has(res.item.id)) continue;
-                            if (res.score < stepThreshold) continue;
-
                             candidates.push(res);
                             tempUsedIds.add(res.item.id);
                             countForThisLabel++;
@@ -1090,7 +1089,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         vector,
                         candidateK,
                         buildFilter({ tags: { $nin: excludeTags } }),
-                        "Chat",
+                        "Step: DIVERSITY",
                         recentWeight,
                         currentSessionId,
                     );
@@ -1100,7 +1099,7 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
                         vector,
                         candidateK,
                         buildFilter({}),
-                        "Chat",
+                        "Step: DIVERSITY",
                         recentWeight,
                         currentSessionId,
                     );
@@ -1120,19 +1119,6 @@ async function performDynamicStrategy(indices, vector, config, ignoreIds = []) {
         for (const res of candidates) {
             if (addedInStep >= limit) break;
             if (usedIds.has(res.item.id)) continue;
-
-            if (res.score < globalMinScore) {
-                if (
-                    ["important", "status", "period", "special"].includes(
-                        step.type,
-                    )
-                ) {
-                    if (res.score < Math.max(0, globalMinScore - 0.2)) continue;
-                } else {
-                    continue;
-                }
-            }
-
             finalResults.push(res);
             usedIds.add(res.item.id);
             addedInStep++;
@@ -1204,6 +1190,7 @@ async function init(router) {
             apiConfig,
             index,
             batch_id,
+            bm25Config,
         } = req.body;
 
         if (
@@ -1279,9 +1266,12 @@ async function init(router) {
                         }));
 
                         // 3. 执行物理 + 逻辑删除
+                        const idsToDeleteFromBm25 = [];
                         for (const plan of deletionPlan) {
                             try {
-                                await targetIndex.deleteItem(plan.id); // 删索引
+                                await targetIndex.deleteItem(plan.id); // 删向量索引
+                                idsToDeleteFromBm25.push(plan.id); // 🟢 记录旧 ID
+
                                 if (
                                     plan.filePath &&
                                     fs.existsSync(plan.filePath)
@@ -1291,6 +1281,25 @@ async function init(router) {
                             } catch (e) {
                                 console.warn(
                                     `[Anima] 覆盖清理旧文件失败: ${e.message}`,
+                                );
+                            }
+                        }
+
+                        // 🟢 新增：把旧数据的幽灵从 BM25 引擎中彻底抹除
+                        if (
+                            idsToDeleteFromBm25.length > 0 &&
+                            bm25Config &&
+                            bm25Config.enabled
+                        ) {
+                            try {
+                                await bm25Engine.deleteDocuments(
+                                    collectionId,
+                                    idsToDeleteFromBm25,
+                                );
+                            } catch (bm25DelErr) {
+                                console.error(
+                                    `[Anima BM25] 清理旧幽灵数据失败:`,
+                                    bm25DelErr,
                                 );
                             }
                         }
@@ -1307,7 +1316,6 @@ async function init(router) {
                         tags,
                         timestamp: safeTimestamp,
                         index,
-                        // ✅ 这里使用处理过的 safeBatchId，而不是原始的 parseInt(batch_id)
                         batch_id: safeBatchId,
                     },
                 });
@@ -1315,6 +1323,29 @@ async function init(router) {
                 console.log(
                     `[Anima RAG] ✅ 写入成功 | Batch: ${safeBatchId} | Index: ${index}`,
                 );
+                if (bm25Config && bm25Config.enabled) {
+                    try {
+                        const dict = bm25Config.dictionary || [];
+
+                        await bm25Engine.upsertDocument(
+                            collectionId,
+                            {
+                                id: newItem.id, // 使用和向量库相同的 ID，方便以后对照
+                                text,
+                                tags,
+                                timestamp: safeTimestamp,
+                                index,
+                                batch_id: safeBatchId,
+                            },
+                            dict,
+                            "chat",
+                        );
+                    } catch (bm25Err) {
+                        console.error(`[Anima BM25] ❌ 同步写入失败:`, bm25Err);
+                        // 注意：BM25 写入失败不应该阻塞响应，仅打印日志
+                    }
+                }
+
                 res.json({ success: true, vectorId: newItem.id });
             });
         } catch (err) {
@@ -1362,45 +1393,52 @@ async function init(router) {
     });
 
     router.post("/import_knowledge", async (req, res) => {
-        const { fileName, fileContent, settings, apiConfig } = req.body;
+        // 🌟 1. 接收 vectorConfig
+        const {
+            fileName,
+            fileContent,
+            settings,
+            apiConfig,
+            bm25Config,
+            vectorConfig,
+        } = req.body;
 
         if (!fileName || !fileContent)
             return res.status(400).send("Missing file data");
 
-        // 1. 构造 Collection ID (格式: kb_文件名)
-        // 去除扩展名并进行安全处理
+        // 🌟 2. 判断是否写入向量库
+        const writeVector = vectorConfig ? vectorConfig.enabled : true;
+
         const safeName = fileName
             .replace(/\.[^/.]+$/, "")
             .replace(/[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g, "_");
         const collectionId = `kb_${safeName}`;
 
-        console.log(`[Anima KB] 📚 正在处理知识库: ${collectionId}`);
+        console.log(
+            `[Anima KB] 📚 处理知识库: ${collectionId} | Vector: ${writeVector} | BM25: ${bm25Config?.enabled}`,
+        );
 
         try {
             await runInQueue(collectionId, async () => {
-                // 2. 获取或创建 Index (允许创建)
-                const targetIndex = await getIndex(collectionId, true);
+                let cleanIndex = null;
 
-                // 3. 覆盖逻辑：如果已存在，先清空
-                // Vectra 没有直接 truncate，我们简单地遍历删除或直接删文件重建
-                // 这里为了稳妥，采用“删文件重建”逻辑（复用之前的 delete_collection 逻辑的一部分）
-                // 简单做法：如果 items > 0，则物理删除文件夹后重新 new LocalIndex
-                const stats = await targetIndex.listItems();
-                if (stats.length > 0) {
-                    console.log(`[Anima KB] 发现旧数据，正在重建库...`);
-                    const folderPath = path.join(VECTOR_ROOT, collectionId);
-                    if (fs.existsSync(folderPath)) {
-                        fs.rmSync(folderPath, { recursive: true, force: true });
-                        // 必须移除内存缓存，否则 LocalIndex 还是指向旧的句柄
-                        activeIndexes.delete(collectionId);
+                // 🌟 3. 如果开启了向量，才去清空旧库并准备实例
+                if (writeVector) {
+                    const targetIndex = await getIndex(collectionId, true);
+                    const stats = await targetIndex.listItems();
+                    if (stats.length > 0) {
+                        console.log(`[Anima KB] 发现旧向量数据，正在重建库...`);
+                        const folderPath = path.join(VECTOR_ROOT, collectionId);
+                        if (fs.existsSync(folderPath)) {
+                            fs.rmSync(folderPath, {
+                                recursive: true,
+                                force: true,
+                            });
+                            activeIndexes.delete(collectionId);
+                        }
                     }
-                    // 重新获取新实例
-                    // 注意：这里需要递归调用自己或者简单地重新 getIndex
-                    // 由于上面删了 activeIndexes，再次 getIndex 会重新创建
+                    cleanIndex = await getIndex(collectionId, true);
                 }
-
-                // 重新获取干净的 index
-                const cleanIndex = await getIndex(collectionId, true);
 
                 // 4. 切片
                 const chunks = chunkText(fileContent, {
@@ -1409,39 +1447,82 @@ async function init(router) {
                 });
 
                 console.log(
-                    `[Anima KB] 切片完成，共 ${chunks.length} 个片段。开始向量化...`,
+                    `[Anima KB] 切片完成，共 ${chunks.length} 个片段。开始处理...`,
                 );
+                const bm25Chunks = [];
 
-                // 5. 批量向量化 (串行，防止 API 速率限制)
+                // 5. 循环处理切片
                 for (let i = 0; i < chunks.length; i++) {
                     const chunkText = chunks[i];
-                    try {
-                        const vector = await getEmbedding(chunkText, apiConfig);
-                        await cleanIndex.insertItem({
-                            vector: vector,
-                            metadata: {
-                                text: chunkText,
-                                doc_name: fileName,
-                                source_type: "knowledge", // 标记类型
-                                chunk_index: i,
-                                timestamp: Date.now(),
-                            },
-                        });
-                        // 简单的进度日志
-                        if ((i + 1) % 10 === 0)
-                            console.log(
-                                `[Anima KB] 进度: ${i + 1}/${chunks.length}`,
+
+                    // 🌟 默认生成一个随机 ID (如果不开向量库，BM25 依然需要 ID 才能运作)
+                    let documentId = `chunk_${i}_${Date.now()}`;
+
+                    // 🌟 如果开启了向量化，调用模型 API
+                    if (writeVector) {
+                        try {
+                            const vector = await getEmbedding(
+                                chunkText,
+                                apiConfig,
                             );
-                    } catch (err) {
+                            const insertedItem = await cleanIndex.insertItem({
+                                vector: vector,
+                                metadata: {
+                                    text: chunkText,
+                                    doc_name: fileName,
+                                    source_type: "knowledge",
+                                    chunk_index: i,
+                                    timestamp: Date.now(),
+                                },
+                            });
+                            // 替换为真实的向量库 UUID
+                            documentId = insertedItem.id;
+
+                            if ((i + 1) % 10 === 0)
+                                console.log(
+                                    `[Anima KB] 向量化进度: ${i + 1}/${chunks.length}`,
+                                );
+                        } catch (err) {
+                            console.error(
+                                `[Anima KB] 片段 ${i} 向量化失败:`,
+                                err.message,
+                            );
+                        }
+                    }
+
+                    // 无论是否生成了向量，都把文本和确定的 ID 存起来给 BM25 备用
+                    bm25Chunks.push({
+                        id: documentId,
+                        text: chunkText,
+                        chunk_index: i,
+                        doc_name: fileName,
+                        timestamp: Date.now(),
+                    });
+                }
+
+                // 6. 如果开启了 BM25，执行 BM25 构建
+                if (bm25Config && bm25Config.enabled && bm25Chunks.length > 0) {
+                    try {
+                        const dict = bm25Config.dictionary || [];
+                        // 覆盖原有的 BM25 库
+                        await bm25Engine.deleteIndex(collectionId);
+                        await bm25Engine.buildIndex(
+                            collectionId,
+                            bm25Chunks,
+                            dict,
+                            "kb",
+                        );
+                        console.log(`[Anima KB] BM25 索引构建完成！`);
+                    } catch (bm25Err) {
                         console.error(
-                            `[Anima KB] 片段 ${i} 向量化失败:`,
-                            err.message,
+                            `[Anima KB BM25] ❌ 构建索引失败:`,
+                            bm25Err,
                         );
                     }
                 }
             });
 
-            res.json({ success: true, collectionId: collectionId, count: 0 }); // count 暂不返回准确值以免复杂
+            res.json({ success: true, collectionId: collectionId, count: 0 });
         } catch (err) {
             console.error("[Anima KB Error]", err);
             res.status(500).send(err.message);
@@ -1464,88 +1545,514 @@ async function init(router) {
         }
     });
 
+    router.get("/bm25/list", async (req, res) => {
+        try {
+            const bm25Root = path.join(__dirname, "data", "bm25_indexes");
+            if (!fs.existsSync(bm25Root)) {
+                return res.json([]); // 如果目录不存在，返回空列表
+            }
+            // 读取目录下的所有文件
+            const files = fs.readdirSync(bm25Root, { withFileTypes: true });
+            const libs = files
+                .filter(
+                    (dirent) =>
+                        dirent.isFile() && dirent.name.endsWith(".json"),
+                )
+                .map((dirent) => dirent.name.replace(".json", "")); // 去掉后缀，只留库名
+
+            res.json(libs);
+        } catch (err) {
+            console.error(`[Anima BM25] 读取库列表失败: ${err.message}`);
+            res.status(500).send(err.message);
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：导出单个 BM25 库文件
+    // ==========================================
+    router.post("/bm25/export_single", async (req, res) => {
+        const { libName } = req.body;
+        try {
+            const safeName = libName.replace(
+                /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+                "_",
+            );
+            const filePath = path.join(
+                __dirname,
+                "data",
+                "bm25_indexes",
+                `${safeName}.json`,
+            );
+
+            if (!fs.existsSync(filePath)) {
+                return res
+                    .status(404)
+                    .json({ success: false, message: "未找到该库的实体文件" });
+            }
+
+            const data = fs.readFileSync(filePath, "utf-8");
+            res.json({ success: true, data: JSON.parse(data) });
+        } catch (e) {
+            console.error(`[Anima BM25] 导出库失败: ${e.message}`);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：导入单个 BM25 库文件
+    // ==========================================
+    router.post("/bm25/import_single", async (req, res) => {
+        const { libName, data } = req.body;
+        try {
+            const safeName = libName.replace(
+                /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+                "_",
+            );
+            const bm25Root = path.join(__dirname, "data", "bm25_indexes");
+
+            if (!fs.existsSync(bm25Root)) {
+                fs.mkdirSync(bm25Root, { recursive: true });
+            }
+
+            const filePath = path.join(bm25Root, `${safeName}.json`);
+            fs.writeFileSync(filePath, JSON.stringify(data));
+
+            console.log(`[Anima BM25] 📥 成功导入库: ${safeName}`);
+            res.json({ success: true });
+        } catch (e) {
+            console.error(`[Anima BM25] 导入库失败: ${e.message}`);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：物理删除单个 BM25 库
+    // ==========================================
+    router.post("/bm25/delete_single", async (req, res) => {
+        const { libName } = req.body;
+        try {
+            const safeName = libName.replace(
+                /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+                "_",
+            );
+            // 直接调用你写好的 bm25Engine 物理删除引擎
+            await bm25Engine.deleteIndex(safeName);
+            res.json({ success: true });
+        } catch (e) {
+            console.error(`[Anima BM25] 删除库失败: ${e.message}`);
+            res.status(500).json({ success: false, message: e.message });
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：从 BM25 逆向重构向量库
+    // ==========================================
+    router.post("/rebuild_vector_from_bm25", async (req, res) => {
+        const { collectionId, apiConfig } = req.body;
+        if (!collectionId) return res.status(400).send("Missing collectionId");
+        if (!apiConfig || !apiConfig.key)
+            return res.status(400).send("Missing API Config");
+
+        const safeName = collectionId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+        console.log(`[Anima RAG] 🚀 尝试从 BM25 逆向重构向量库: ${safeName}`);
+
+        try {
+            await runInQueue(safeName, async () => {
+                // 1. 读取底层的 BM25 库文件
+                const bm25Path = path.join(
+                    __dirname,
+                    "data",
+                    "bm25_indexes",
+                    `${safeName}.json`,
+                );
+                if (!fs.existsSync(bm25Path)) {
+                    throw new Error("BM25 库文件不存在，无法提取原文");
+                }
+
+                // MiniSearch 导出的 JSON 中，storedFields 保存了完整的原始信息
+                const indexData = JSON.parse(
+                    fs.readFileSync(bm25Path, "utf-8"),
+                );
+                const allDocs = Object.values(indexData.storedFields || {});
+
+                if (allDocs.length === 0) {
+                    throw new Error("BM25 库中未检测到存储的文本内容");
+                }
+
+                // 2. 初始化目标向量库 (如果旧库有残留碎片，先安全清空)
+                const targetIndex = await getIndex(safeName, true);
+                const existingStats = await targetIndex.listItems();
+                if (existingStats.length > 0) {
+                    const folderPath = path.join(VECTOR_ROOT, safeName);
+                    if (fs.existsSync(folderPath)) {
+                        fs.rmSync(folderPath, { recursive: true, force: true });
+                        activeIndexes.delete(safeName);
+                    }
+                }
+
+                // 获取彻底纯净的向量库实例
+                const cleanIndex = await getIndex(safeName, true);
+
+                let successCount = 0;
+                let failCount = 0;
+
+                // 3. 循环遍历提取的文本，请求 API 生成向量
+                for (const doc of allDocs) {
+                    if (!doc.text) continue;
+                    try {
+                        const vector = await getEmbedding(doc.text, apiConfig);
+
+                        // 插入向量库，完美继承当初在 BM25 记录的所有切片特征
+                        await cleanIndex.insertItem({
+                            vector: vector,
+                            metadata: {
+                                text: doc.text,
+                                doc_name: doc.doc_name || "recovered_from_bm25",
+                                source_type: "knowledge",
+                                chunk_index: doc.chunk_index || 0,
+                                timestamp: doc.timestamp || Date.now(),
+                                tags: doc.tags || [],
+                                index: doc.index,
+                                batch_id: doc.batch_id,
+                            },
+                        });
+
+                        successCount++;
+                        // 终端每10条打印一次进度
+                        if (successCount % 10 === 0) {
+                            console.log(
+                                `[Anima RAG] 逆向向量化进度: ${successCount}/${allDocs.length}`,
+                            );
+                        }
+                    } catch (err) {
+                        console.error(
+                            `[Anima RAG] 逆向向量化失败 (${doc.id}): ${err.message}`,
+                        );
+                        failCount++;
+                    }
+                }
+
+                console.log(
+                    `[Anima RAG] ✅ 逆向重构向量库完成. 成功: ${successCount}, 失败: ${failCount}`,
+                );
+                res.json({
+                    success: true,
+                    count: successCount,
+                    failed: failCount,
+                });
+            });
+        } catch (err) {
+            console.error(`[Anima RAG] 逆向重构失败: ${err.message}`);
+            res.status(500).send(err.message);
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增/修改：全量重建单个 BM25 库 (支持无向量库兜底)
+    // ==========================================
+    router.post("/bm25/rebuild_collection", async (req, res) => {
+        const { collectionId, bm25Config } = req.body;
+        if (!collectionId)
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing collectionId" });
+
+        const safeName = collectionId.replace(
+            /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+            "_",
+        );
+        console.log(`[Anima BM25] 🚀 开始全量重建库: ${safeName}`);
+
+        try {
+            await runInQueue(safeName, async () => {
+                const bm25Chunks = [];
+                let hasVectorSource = false;
+
+                // 1. 优先尝试获取向量库的数据作为原文来源
+                try {
+                    const targetIndex = await getIndex(safeName, false);
+                    if (targetIndex) {
+                        hasVectorSource = true;
+                        const items = await targetIndex.listItems();
+                        const folderPath = path.join(VECTOR_ROOT, safeName);
+
+                        for (const item of items) {
+                            try {
+                                const fileName =
+                                    item.metadataFile || `${item.id}.json`;
+                                const filePath = path.join(
+                                    folderPath,
+                                    fileName,
+                                );
+                                if (!fs.existsSync(filePath)) continue;
+
+                                const fileContent = await fs.promises.readFile(
+                                    filePath,
+                                    "utf-8",
+                                );
+                                const fullData = JSON.parse(fileContent);
+                                const meta = fullData.metadata || fullData;
+
+                                if (!meta.text) continue;
+
+                                bm25Chunks.push({
+                                    id: item.id,
+                                    text: meta.text,
+                                    tags: meta.tags || [],
+                                    timestamp: meta.timestamp || Date.now(),
+                                    index: meta.index,
+                                    batch_id: meta.batch_id,
+                                    chunk_index: meta.chunk_index,
+                                    doc_name: meta.doc_name,
+                                });
+                            } catch (readErr) {
+                                console.warn(
+                                    `[Anima BM25] 读取向量库条目 ${item.id} 失败，跳过`,
+                                );
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // 忽略报错，交给下方的兜底逻辑处理
+                }
+
+                // 2. 🛡️ 兜底逻辑：如果向量库不存在，从现存的旧 BM25 库中提取文本
+                if (!hasVectorSource || bm25Chunks.length === 0) {
+                    console.log(
+                        `[Anima BM25] ⚠️ 未检测到向量库，尝试从旧 BM25 库提取原文...`,
+                    );
+                    const bm25Path = path.join(
+                        __dirname,
+                        "data",
+                        "bm25_indexes",
+                        `${safeName}.json`,
+                    );
+
+                    if (fs.existsSync(bm25Path)) {
+                        const indexData = JSON.parse(
+                            fs.readFileSync(bm25Path, "utf-8"),
+                        );
+                        const allDocs = Object.values(
+                            indexData.storedFields || {},
+                        );
+
+                        for (const doc of allDocs) {
+                            if (!doc.text) continue;
+                            bm25Chunks.push({
+                                id: doc.id,
+                                text: doc.text,
+                                tags: doc.tags || [],
+                                timestamp: doc.timestamp || Date.now(),
+                                index: doc.index,
+                                batch_id: doc.batch_id,
+                                chunk_index: doc.chunk_index,
+                                doc_name: doc.doc_name,
+                            });
+                        }
+                    } else {
+                        throw new Error(
+                            "找不到对应的底层向量库提供文本数据，且旧 BM25 库也不存在。",
+                        );
+                    }
+                }
+
+                // 3. 🛡️ 核心保障：物理删除旧的 BM25 库（绝对防重复！）
+                await bm25Engine.deleteIndex(safeName);
+
+                // 4. 重新构建全新的 BM25 库
+                if (bm25Chunks.length > 0) {
+                    const dict = bm25Config?.dictionary || [];
+                    await bm25Engine.buildIndex(
+                        safeName,
+                        bm25Chunks,
+                        dict,
+                        "chat",
+                    );
+                }
+
+                console.log(
+                    `[Anima BM25] ✅ 库 ${safeName} 重建完毕，共写入 ${bm25Chunks.length} 条数据`,
+                );
+                res.json({ success: true, count: bm25Chunks.length });
+            });
+        } catch (err) {
+            console.error(`[Anima BM25] 重建失败: ${err.message}`);
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    // ==========================================
+    // 🟢 新增：单切片 BM25 增量重构接口
+    // ==========================================
+    router.post("/bm25/rebuild_slice", async (req, res) => {
+        const {
+            collectionId,
+            index,
+            text,
+            tags,
+            timestamp,
+            batch_id,
+            bm25Config,
+        } = req.body;
+
+        if (!collectionId || index === undefined || !text) {
+            return res
+                .status(400)
+                .json({ success: false, message: "Missing required fields" });
+        }
+
+        try {
+            const safeName = collectionId.replace(
+                /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
+                "_",
+            );
+
+            // 尝试去向量库中找原有的 document ID (防止和向量库ID脱节)，如果没有向量库，就兜底使用 index 作为 ID
+            let documentId = `slice_${index}`;
+            try {
+                const targetIndex = await getIndex(safeName, false);
+                if (targetIndex) {
+                    const allItems = await targetIndex.listItems();
+                    const target = allItems.find(
+                        (item) =>
+                            item.metadata &&
+                            String(item.metadata.index) === String(index),
+                    );
+                    if (target) documentId = target.id;
+                }
+            } catch (e) {
+                // 忽略：向量库可能还没创建，BM25 允许独立运行
+            }
+
+            const dict = bm25Config.dictionary || [];
+
+            // 呼叫底层的 BM25 引擎进行写入
+            await bm25Engine.upsertDocument(
+                safeName,
+                { id: documentId, text, tags, timestamp, index, batch_id },
+                dict,
+                "chat",
+            );
+
+            res.json({ success: true });
+        } catch (err) {
+            console.error(`[Anima BM25] 切片重构失败: ${err.message}`);
+            res.status(500).json({ success: false, message: err.message });
+        }
+    });
+
+    // 🚀 新增：BM25 批量增量重构接口
+    router.post("/bm25/rebuild_slice_batch", async (req, res) => {
+        try {
+            const { collectionId, slices, bm25Config } = req.body;
+
+            if (!slices || !Array.isArray(slices) || slices.length === 0) {
+                return res.json({ success: false, message: "切片数组为空" });
+            }
+
+            const addedCount = await bm25Engine.buildIndexBatch(
+                collectionId,
+                slices,
+                bm25Config,
+            );
+
+            res.json({ success: true, count: addedCount });
+        } catch (e) {
+            console.error("[Anima BM25] 批量重构路由异常:", e);
+            res.json({ success: false, message: e.message });
+        }
+    });
+
     router.post("/view_collection", async (req, res) => {
         const { collectionId } = req.body;
         if (!collectionId) return res.status(400).send("Missing collectionId");
 
         try {
-            // 1. 获取索引实例
-            const targetIndex = await getIndex(collectionId, false);
-
-            if (!targetIndex) {
-                return res.status(404).json({ error: "Database not found" });
-            }
-
-            // 2. 获取所有条目索引
-            const indexItems = await targetIndex.listItems();
-
-            // 3. 准备路径工具
+            // 准备路径工具
             const safeName = collectionId.replace(
                 /[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g,
                 "_",
             );
             const collectionPath = path.join(VECTOR_ROOT, safeName);
 
-            // 4. 🟢 核心修复：直接读取磁盘文件
-            const formattedItems = await Promise.all(
-                indexItems.map(async (entry) => {
-                    try {
-                        // 优先使用 entry.metadataFile (vectra 可能会提供)，如果没有则尝试 id.json
-                        // 如果你的 vectra 版本不提供 metadataFile，通常文件名就是 id.json
-                        const fileName =
-                            entry.metadataFile || `${entry.id}.json`;
-                        const filePath = path.join(collectionPath, fileName);
+            let validItems = [];
 
-                        if (!fs.existsSync(filePath)) {
-                            console.warn(
-                                `[Anima RAG] ⚠️ 文件丢失: ${fileName}`,
+            // 1. 尝试获取向量索引实例
+            const targetIndex = await getIndex(collectionId, false);
+
+            if (targetIndex) {
+                const indexItems = await targetIndex.listItems();
+                const formattedItems = await Promise.all(
+                    indexItems.map(async (entry) => {
+                        try {
+                            const fileName =
+                                entry.metadataFile || `${entry.id}.json`;
+                            const filePath = path.join(
+                                collectionPath,
+                                fileName,
                             );
+
+                            if (!fs.existsSync(filePath)) return null;
+
+                            const fileContent = await fs.promises.readFile(
+                                filePath,
+                                "utf-8",
+                            );
+                            const fullData = JSON.parse(fileContent);
+                            const meta = fullData.metadata || fullData;
+
+                            return {
+                                id: entry.id,
+                                text: meta.text || "",
+                                metadata: {
+                                    chunk_index: meta.chunk_index,
+                                    doc_name: meta.doc_name,
+                                    timestamp: meta.timestamp,
+                                },
+                            };
+                        } catch (e) {
                             return null;
                         }
-
-                        const fileContent = await fs.promises.readFile(
-                            filePath,
-                            "utf-8",
-                        );
-                        const fullData = JSON.parse(fileContent);
-
-                        // 兼容性处理：数据可能在 root，也可能在 metadata 字段下
-                        // 根据你提供的 UUID.json 内容，数据似乎平铺在 root 或者 metadata 里
-                        // 我们做一个合并策略以防万一
-                        const meta = fullData.metadata || fullData;
-
-                        return {
-                            id: entry.id,
-                            text: meta.text || "",
-                            metadata: {
-                                chunk_index: meta.chunk_index, // 这样一定能取到
-                                doc_name: meta.doc_name,
-                                timestamp: meta.timestamp,
-                            },
-                        };
-                    } catch (e) {
-                        console.warn(
-                            `[Anima RAG] 读取切片失败 (${entry.id}): ${e.message}`,
-                        );
-                        return null;
-                    }
-                }),
-            );
-
-            // 过滤掉读取失败的
-            const validItems = formattedItems.filter((i) => i !== null);
-
-            // 🟢 调试日志：打印第一条数据，看看长什么样
-            if (validItems.length > 0) {
-                console.log(
-                    "[Anima Debug] 第一条数据预览:",
-                    JSON.stringify(validItems[0].metadata),
+                    }),
                 );
+                validItems = formattedItems.filter((i) => i !== null);
             }
 
-            console.log(
-                `[Anima RAG] 👀 查看库: ${collectionId} | 磁盘读取: ${validItems.length}`,
-            );
+            // 2. 🟢 核心修复：如果向量库不存在（或被清空），尝试兜底读取同名的 BM25 本地文件
+            if (validItems.length === 0) {
+                const bm25Path = path.join(
+                    __dirname,
+                    "data",
+                    "bm25_indexes",
+                    `${safeName}.json`,
+                );
+                if (fs.existsSync(bm25Path)) {
+                    const indexData = JSON.parse(
+                        fs.readFileSync(bm25Path, "utf-8"),
+                    );
+                    const allDocs = Object.values(indexData.storedFields || {});
+
+                    validItems = allDocs.map((doc) => ({
+                        id: doc.id,
+                        text: doc.text || "",
+                        metadata: {
+                            chunk_index: doc.chunk_index,
+                            doc_name: doc.doc_name,
+                            timestamp: doc.timestamp,
+                        },
+                    }));
+                }
+            }
+
+            // 3. 如果两边都找不到，才抛出 404
+            if (validItems.length === 0) {
+                return res
+                    .status(404)
+                    .json({ error: "Database not found or is empty" });
+            }
 
             res.json({ items: validItems });
         } catch (err) {
@@ -1559,15 +2066,16 @@ async function init(router) {
     // ==========================================
     router.post("/query", async (req, res) => {
         try {
-            // 1. 获取基础参数 (这里解构后，sessionId 就已经存在了)
             const {
                 searchText,
+                bm25SearchText,
                 apiConfig,
                 ignore_ids,
                 echoConfig,
                 sessionId,
                 is_swipe,
                 rerankConfig,
+                bm25Configs = {},
             } = req.body;
 
             // --- 兼容旧版参数 ---
@@ -1582,9 +2090,14 @@ async function init(router) {
             const kbContext = req.body.kbContext || { ids: [], strategy: null };
 
             // 2. 向量化
-            if (!searchText)
+            if (!searchText && !bm25SearchText)
                 return res.json({ chat_results: [], kb_results: [] });
-            const vector = await getEmbedding(searchText, apiConfig);
+
+            // 兜底：如果向量检索词为空，则 vector 为 null，防止 getEmbedding 报错
+            let vector = null;
+            if (searchText) {
+                vector = await getEmbedding(searchText, apiConfig);
+            }
 
             // ============================================================
             // 🧠 [新增] 会话状态预处理 (GC vs Resurrection)
@@ -1648,8 +2161,12 @@ async function init(router) {
             // 3. 定义并行任务
             const tasks = [];
 
+            let bm25ChatResults = [];
+            let bm25KbResults = [];
+
             // --- 任务 A: 聊天记录检索 ---
             const chatTask = async () => {
+                if (!vector) return [];
                 const targetIds = Array.isArray(chatContext.ids)
                     ? chatContext.ids.filter((id) => id)
                     : [];
@@ -1770,6 +2287,404 @@ async function init(router) {
                 return raw;
             };
             tasks.push(kbTask());
+
+            // 🟢 [新增] 任务 C: BM25 聊天库检索
+            const bm25ChatTask = async () => {
+                if (!bm25Configs.chat || bm25Configs.chat.length === 0) return;
+
+                const validBm25Text =
+                    bm25SearchText && bm25SearchText.trim().length > 0
+                        ? bm25SearchText
+                        : null;
+                const targetText = validBm25Text || searchText;
+                if (!targetText || targetText.trim() === "") return;
+
+                // =========================================================
+                // ✨ 核心改造 1：精准剥离“最新 User 意图”与“历史上下文” (强力抗干扰版)
+                // =========================================================
+                let userTextPool = "";
+                let contextTextPool = "";
+
+                // 统一使用物理截断，防止没有换行符的合并文本干扰
+                const lowerTargetText = targetText.toLowerCase();
+                const lastUserIdx = lowerTargetText.lastIndexOf("user:");
+
+                if (lastUserIdx !== -1) {
+                    contextTextPool = targetText.substring(0, lastUserIdx);
+                    userTextPool = targetText.substring(lastUserIdx);
+                } else {
+                    userTextPool = targetText;
+                }
+
+                // =========================================================
+                // ✨ 核心改造 1.5：意图雷达 (探测时间极值)
+                // =========================================================
+                const intentFirstWords = [
+                    "第一次",
+                    "第一回",
+                    "第一眼",
+                    "第一面",
+                    "首次",
+                    "首回",
+                    "初回",
+                    "初次",
+                    "最早",
+                    "最初",
+                ];
+                const intentLastWords = [
+                    "最后",
+                    "最近",
+                    "上次",
+                    "上一次",
+                    "上一回",
+                    "上回",
+                ];
+
+                let temporalIntent = null;
+                const lowerUserTextOnly = userTextPool.toLowerCase();
+
+                if (
+                    intentFirstWords.some((w) => lowerUserTextOnly.includes(w))
+                ) {
+                    temporalIntent = "first";
+                } else if (
+                    intentLastWords.some((w) => lowerUserTextOnly.includes(w))
+                ) {
+                    temporalIntent = "last";
+                }
+
+                // =========================================================
+                // ✨ 核心改造 2：分层扫描与收集
+                // =========================================================
+                let userTriggeredIndexes = [];
+                let contextTriggeredIndexes = [];
+                let hasTrigger = false;
+                let totalRules = 0;
+
+                const lowerUserText = userTextPool.toLowerCase();
+                const lowerContextText = contextTextPool.toLowerCase();
+
+                bm25Configs.chat.forEach((config) => {
+                    const dict =
+                        config.dictionary || config.dict || config.words || [];
+                    totalRules += dict.length;
+
+                    dict.forEach((rule) => {
+                        const rawTrigger = rule.trigger || "";
+                        const triggers = rawTrigger
+                            .split(/[,，]/)
+                            .map((t) => t.trim())
+                            .filter(Boolean);
+                        const indexWord = (rule.index || "").trim();
+
+                        const actualTriggers = [...triggers];
+                        if (indexWord && !actualTriggers.includes(indexWord))
+                            actualTriggers.push(indexWord);
+
+                        if (actualTriggers.length > 0) {
+                            const hitUser = actualTriggers.some((t) =>
+                                lowerUserText.includes(t.toLowerCase()),
+                            );
+                            if (hitUser) {
+                                hasTrigger = true;
+                                if (indexWord)
+                                    userTriggeredIndexes.push(indexWord);
+                            }
+                            if (!hitUser) {
+                                const hitContext = actualTriggers.some((t) =>
+                                    lowerContextText.includes(t.toLowerCase()),
+                                );
+                                if (hitContext) {
+                                    hasTrigger = true;
+                                    if (indexWord)
+                                        contextTriggeredIndexes.push(indexWord);
+                                }
+                            }
+                        }
+                    });
+                });
+
+                if (totalRules > 0 && !hasTrigger) {
+                    console.log(
+                        `[Anima BM25] 🛑 未命中任何触发词，跳过 Chat 检索。`,
+                    );
+                    return;
+                }
+
+                // =========================================================
+                // ✨ 核心改造 3：阶梯式词频加权 (TF Boosting) & Debug 日志
+                // =========================================================
+                const chatTopK = bm25Configs.chat_top_k || 3;
+                let intentResults = [];
+
+                // 🌟 线路 A：如果探测到时间极值意图，交由特种部队处理
+                // 🔴 核心修复：把 User 和 Context 里的实体合并！因为 User 经常用代词省略主语
+                if (temporalIntent && userTriggeredIndexes.length > 0) {
+                    const uniqueUserEntities = [
+                        ...new Set(userTriggeredIndexes),
+                    ];
+
+                    console.log(
+                        `[Anima BM25 Debug] ⏱️ 探测到时间极值意图: [${temporalIntent}] | 关联核心实体(仅User): [${uniqueUserEntities.join(", ")}]`,
+                    );
+
+                    intentResults = await bm25Engine.temporalIntentSearch(
+                        uniqueUserEntities,
+                        bm25Configs.chat,
+                        temporalIntent,
+                    );
+
+                    intentResults = intentResults.map((r) => {
+                        r.score = 999.0;
+                        r._is_intent = true;
+                        return r;
+                    });
+
+                    console.log(
+                        `[Anima BM25 Debug] ⚡ 意图拦截执行完毕，提取了 ${intentResults.length} 条绝对时间切片。`,
+                    );
+                }
+
+                // 计算剩余的 Top K 坑位
+                const remainingK = Math.max(0, chatTopK - intentResults.length);
+                let standardResults = [];
+
+                // 🌟 线路 B：剩余坑位交由传统的 TF-IDF 模糊联想填充
+                if (remainingK > 0) {
+                    const cleanText = targetText
+                        .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, " ")
+                        .replace(/\s+/g, " ")
+                        .trim();
+                    let boostStrArr = [];
+
+                    if (contextTriggeredIndexes.length > 0) {
+                        const uniqueContexts = [
+                            ...new Set(contextTriggeredIndexes),
+                        ];
+                        boostStrArr.push(uniqueContexts.join(" "));
+                    }
+
+                    if (userTriggeredIndexes.length > 0) {
+                        const uniqueUsers = [...new Set(userTriggeredIndexes)];
+                        boostStrArr.push(
+                            uniqueUsers.map((t) => `${t} ${t} ${t}`).join(" "),
+                        );
+                    }
+
+                    const finalBoostStr = boostStrArr.join(" ");
+                    const boostedQuery = finalBoostStr
+                        ? `${cleanText} ${finalBoostStr}`
+                        : cleanText;
+
+                    console.log(
+                        `[Anima BM25 Debug] 🚀 发往引擎的最终加权检索词 (Boosted Query):\n=> "${boostedQuery}"`,
+                    );
+
+                    standardResults = await bm25Engine.searchPipeline(
+                        boostedQuery,
+                        bm25Configs.chat,
+                        remainingK,
+                        "chat",
+                    );
+                    console.log(
+                        `[Anima BM25 Debug] 📊 常规模糊检索执行完毕，返回了 ${standardResults.length} 条结果。`,
+                    );
+                }
+
+                // 🌟 合并并去重
+                const mergedMap = new Map();
+                [...intentResults, ...standardResults].forEach((item) => {
+                    const uniqueKey = item.index || item.id;
+                    if (!mergedMap.has(uniqueKey)) {
+                        mergedMap.set(uniqueKey, item);
+                    }
+                });
+
+                const combinedResults = Array.from(mergedMap.values());
+
+                // 解决前端显示 Unknown 数据库的问题
+                bm25ChatResults = combinedResults.map((r) => {
+                    const src =
+                        r._source_db ||
+                        r.dbId ||
+                        r.collectionId ||
+                        r._source_collection ||
+                        r.source ||
+                        "Unknown";
+                    return {
+                        ...r,
+                        type: "bm25",
+                        source: src,
+                        _source_collection: src,
+                    };
+                });
+            };
+            tasks.push(bm25ChatTask());
+
+            // 🟢 [新增] 任务 D: BM25 知识库检索
+            const bm25KbTask = async () => {
+                if (!bm25Configs.kb || bm25Configs.kb.length === 0) return;
+
+                const validBm25Text =
+                    bm25SearchText && bm25SearchText.trim().length > 0
+                        ? bm25SearchText
+                        : null;
+                const targetText = validBm25Text || searchText;
+                if (!targetText || targetText.trim() === "") return;
+
+                // =========================================================
+                // ✨ 核心改造 1：精准剥离“最新 User 意图”与“历史上下文”
+                // =========================================================
+                let userTextPool = "";
+                let contextTextPool = "";
+
+                const lines = targetText.split("\n");
+                let lastUserIdx = -1;
+
+                // 1. 倒序查找，精准定位“最后一楼 User”所在的行索引
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    if (lines[i].trim().toLowerCase().startsWith("user:")) {
+                        lastUserIdx = i;
+                        break;
+                    }
+                }
+
+                if (lastUserIdx !== -1) {
+                    // 2. 将最后一楼 User 之前的所有行，全部归入辅助上下文
+                    contextTextPool = lines.slice(0, lastUserIdx).join(" ");
+                    // 3. 将最后一楼 User 及其之后的多行，归入强意图池
+                    userTextPool = lines.slice(lastUserIdx).join(" ");
+                } else {
+                    // 兜底：如果没有 user: 前缀，统统算作强意图
+                    userTextPool = targetText;
+                }
+
+                // =========================================================
+                // ✨ 核心改造 2：分层扫描与收集
+                // =========================================================
+                let userTriggeredIndexes = [];
+                let contextTriggeredIndexes = [];
+                let hasTrigger = false;
+                let totalRules = 0;
+
+                const lowerUserText = userTextPool.toLowerCase();
+                const lowerContextText = contextTextPool.toLowerCase();
+
+                bm25Configs.kb.forEach((config) => {
+                    const dict =
+                        config.dictionary || config.dict || config.words || [];
+                    totalRules += dict.length;
+
+                    dict.forEach((rule) => {
+                        const rawTrigger = rule.trigger || "";
+                        const triggers = rawTrigger
+                            .split(/[,，]/)
+                            .map((t) => t.trim())
+                            .filter(Boolean);
+                        const indexWord = (rule.index || "").trim();
+
+                        const actualTriggers = [...triggers];
+                        if (indexWord && !actualTriggers.includes(indexWord)) {
+                            actualTriggers.push(indexWord);
+                        }
+
+                        if (actualTriggers.length > 0) {
+                            // 先扫描 User 强意图池
+                            const hitUser = actualTriggers.some((t) =>
+                                lowerUserText.includes(t.toLowerCase()),
+                            );
+
+                            if (hitUser) {
+                                hasTrigger = true;
+                                if (indexWord)
+                                    userTriggeredIndexes.push(indexWord);
+                            }
+
+                            // 如果 User 没命中，再看历史上下文有没有命中
+                            if (!hitUser) {
+                                const hitContext = actualTriggers.some((t) =>
+                                    lowerContextText.includes(t.toLowerCase()),
+                                );
+                                if (hitContext) {
+                                    hasTrigger = true;
+                                    if (indexWord)
+                                        contextTriggeredIndexes.push(indexWord);
+                                }
+                            }
+                        }
+                    });
+                });
+
+                // 如果配置了知识库词典但全都没命中，跳过检索
+                if (totalRules > 0 && !hasTrigger) {
+                    console.log(
+                        `[Anima BM25] 🛑 未命中任何触发词，跳过 KB 检索。`,
+                    );
+                    return;
+                }
+
+                // =========================================================
+                // ✨ 核心改造 3：阶梯式词频加权 (TF Boosting)
+                // =========================================================
+                const cleanText = targetText
+                    .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, " ")
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+                let boostStrArr = [];
+
+                // 👉 辅助内容 (历史楼层)：重复 1 次
+                if (contextTriggeredIndexes.length > 0) {
+                    const uniqueContexts = [
+                        ...new Set(contextTriggeredIndexes),
+                    ];
+                    boostStrArr.push(uniqueContexts.join(" "));
+                }
+
+                // 👉 核心意图 (最新 User)：重复 3 次
+                if (userTriggeredIndexes.length > 0) {
+                    const uniqueUsers = [...new Set(userTriggeredIndexes)];
+                    const userBoost = uniqueUsers
+                        .map((t) => `${t} ${t} ${t}`)
+                        .join(" ");
+                    boostStrArr.push(userBoost);
+                    console.log(
+                        `[Anima KB BM25] 🎯 强意图命中(User)! 加权: [${uniqueUsers.join(", ")}]`,
+                    );
+                }
+
+                const finalBoostStr = boostStrArr.join(" ");
+                const boostedQuery = finalBoostStr
+                    ? `${cleanText} ${finalBoostStr}`
+                    : cleanText;
+
+                const strat = kbContext.strategy || {};
+                const bm25Count = strat.bm25_top_k || 3;
+
+                const results = await bm25Engine.searchPipeline(
+                    boostedQuery,
+                    bm25Configs.kb,
+                    bm25Count,
+                    "kb",
+                );
+
+                bm25KbResults = results.map((r) => {
+                    const src =
+                        r._source_db ||
+                        r.dbId ||
+                        r.collectionId ||
+                        r._source_collection ||
+                        r.source ||
+                        "Unknown";
+                    return {
+                        ...r,
+                        type: "bm25",
+                        source: src,
+                        _source_collection: src,
+                    };
+                });
+            };
+            tasks.push(bm25KbTask());
 
             // 4. 并行等待结果
             const [chatRaw, kbRaw] = await Promise.all(tasks);
@@ -1942,15 +2857,109 @@ async function init(router) {
                     source: r["_source_collection"] || "unknown",
                     doc_name: r.item.metadata.doc_name,
                     is_echo: r._is_echo || r.is_echo || false,
+                    type: "vector",
                 }));
             };
-            const executionLogs = finalChatResults["_debug_logs"] || [];
+            const formattedVectorChat = formatResults(finalChatResults);
+            const formattedVectorKb = formatResults(kbRaw);
 
-            // 7. 返回合并对象
+            // ============================================================
+            // 🧠 [新增] 后端核心：双轨去重与排序逻辑
+            // ============================================================
+
+            // 1. Chat 结果去重合并 (Vector + BM25)
+            const mergeAndSortChat = (vecList, bm25List) => {
+                const uniqueMap = new Map();
+                const all = [...(vecList || []), ...(bm25List || [])];
+
+                all.forEach((item) => {
+                    // 使用 index (如 "1_2") 或 id 作为唯一键
+                    const uniqueKey = item.index || item.id;
+                    if (!uniqueMap.has(uniqueKey)) {
+                        uniqueMap.set(uniqueKey, item);
+                    }
+                });
+
+                const merged = Array.from(uniqueMap.values());
+
+                // 严格按时间线排序
+                merged.sort((a, b) => {
+                    const timeA = new Date(a.timestamp || 0).getTime();
+                    const timeB = new Date(b.timestamp || 0).getTime();
+                    if (timeA !== timeB) return timeA - timeB;
+
+                    const idxA = String(a.index || "0_0");
+                    const idxB = String(b.index || "0_0");
+
+                    const [batchA, sliceA] = idxA.split("_").map(Number);
+                    const [batchB, sliceB] = idxB.split("_").map(Number);
+
+                    if (isNaN(batchA) || isNaN(batchB)) {
+                        return idxA.localeCompare(idxB, undefined, {
+                            numeric: true,
+                        });
+                    }
+                    if (batchA !== batchB) return batchA - batchB;
+                    return (sliceA || 0) - (sliceB || 0);
+                });
+                return merged;
+            };
+
+            // 2. KB 结果去重合并 (Vector + BM25)
+            const mergeAndSortKb = (vecList, bm25List) => {
+                const uniqueMap = new Map();
+                const all = [...(vecList || []), ...(bm25List || [])];
+
+                all.forEach((item) => {
+                    // 使用文档名+切片序号作为复合唯一键
+                    const fallbackId =
+                        (item.doc_name || "unknown") +
+                        "_" +
+                        (item.chunk_index || 0);
+                    const uniqueKey = item.id || fallbackId;
+
+                    if (!uniqueMap.has(uniqueKey)) {
+                        uniqueMap.set(uniqueKey, item);
+                    }
+                });
+
+                const merged = Array.from(uniqueMap.values());
+
+                // 先按文档名称，再按切片序号排序
+                merged.sort((a, b) => {
+                    const docA = a.doc_name || "";
+                    const docB = b.doc_name || "";
+                    if (docA !== docB) return docA.localeCompare(docB);
+                    return (a.chunk_index || 0) - (b.chunk_index || 0);
+                });
+                return merged;
+            };
+
+            const finalMergedChat = mergeAndSortChat(
+                formattedVectorChat,
+                bm25ChatResults,
+            );
+            const finalMergedKb = mergeAndSortKb(
+                formattedVectorKb,
+                bm25KbResults,
+            );
+
+            // 7. 返回扩充后的全量对象，满足前端所有 UI 模块的日志需求
             res.json({
-                chat_results: formatResults(finalChatResults),
-                kb_results: formatResults(kbRaw),
+                // [给 RAG / BM25 模块做独立日志用]
+                vector_chat_results: formattedVectorChat,
+                bm25_chat_results: bm25ChatResults,
+
+                // [给 KB 模块做独立日志用]
+                vector_kb_results: formattedVectorKb,
+                bm25_kb_results: bm25KbResults,
+
+                // [给底层步骤分析用]
                 _debug_logs: collectedLogs,
+
+                // [给拦截器直接注入 Prompt，以及主控台看最终结果用]
+                merged_chat_results: finalMergedChat,
+                merged_kb_results: finalMergedKb,
             });
         } catch (err) {
             console.error(err);
@@ -2349,7 +3358,9 @@ async function init(router) {
             // Node.js 14.14+ 支持 { recursive: true }
             fs.rmSync(collectionPath, { recursive: true, force: true });
 
-            console.log(`[Anima RAG] 🗑️ 整个数据库已物理删除: ${collectionId}`);
+            // 🌟 移除了强制删除 BM25 库的代码，实现两库分离独立删除
+
+            console.log(`[Anima RAG] 🗑️ 向量数据库已物理删除: ${collectionId}`);
             res.json({ success: true });
         } catch (err) {
             console.error(
@@ -2451,6 +3462,14 @@ async function init(router) {
                 }
             }
 
+            const idsToDelete = deletionPlan.map((p) => p.id);
+            if (idsToDelete.length > 0) {
+                // 加 catch 防止由于 BM25 没数据报错影响主流程
+                await bm25Engine
+                    .deleteDocuments(collectionId, idsToDelete)
+                    .catch((e) => console.error(e));
+            }
+
             console.log(
                 `[Anima RAG] 🧹 Batch ${batch_id} 清理完毕: 索引删除了 ${deletedCount} 个, 物理文件删除了 ${physicalDeleteCount} 个`,
             );
@@ -2530,6 +3549,13 @@ async function init(router) {
                 } catch (e) {
                     console.warn(`[Anima RAG] 单条删除异常: ${e.message}`);
                 }
+            }
+
+            const idsToDelete = deletionPlan.map((p) => p.id);
+            if (idsToDelete.length > 0) {
+                await bm25Engine
+                    .deleteDocuments(collectionId, idsToDelete)
+                    .catch((e) => console.error(e));
             }
 
             console.log(
