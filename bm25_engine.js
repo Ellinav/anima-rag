@@ -1,9 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const MiniSearch = require("minisearch");
-
-const segmenter = new Intl.Segmenter("zh-CN", { granularity: "word" });
-const customDictPool = new Set(); // 替代 nodejieba.insertWord 的原生词库池
+const { add_word, cut_for_search } = require("jieba-wasm");
 
 const BM25_ROOT = path.join(__dirname, "data", "bm25_indexes");
 
@@ -19,14 +17,14 @@ class BM25Engine {
     _syncJieba(dictionary) {
         if (!dictionary || dictionary.length === 0) return;
         dictionary.forEach((rule) => {
-            // 提取所有触发词 (兼容各种格式)
+            // 🟢 提取所有触发词 (兼容各种格式)
             let safeTriggers = [];
             if (Array.isArray(rule.triggers)) safeTriggers = rule.triggers;
             else if (typeof rule.trigger === "string")
                 safeTriggers = rule.trigger.split(/[,，|]/);
             else if (rule.triggers) safeTriggers = [rule.triggers];
 
-            // 提取所有索引词 (兼容各种格式)
+            // 🟢 提取所有索引词 (兼容各种格式)
             let safeIndexWords = [];
             if (Array.isArray(rule.indexWords))
                 safeIndexWords = rule.indexWords;
@@ -34,38 +32,27 @@ class BM25Engine {
                 safeIndexWords = rule.index.split(/[,，|]/);
             else if (rule.indexWords) safeIndexWords = [rule.indexWords];
 
-            // 合并词池
+            // 🌟 合并词池：让分词器认识所有的触发词和索引词
             const allWords = [...new Set([...safeTriggers, ...safeIndexWords])];
 
             allWords.forEach((word) => {
                 const cleanWord = word?.trim();
                 if (cleanWord) {
-                    // 🟢 将专有名词直接塞入我们自己的原生词池
-                    customDictPool.add(cleanWord);
+                    // ✅ 将 nodejieba.insertWord 替换为 add_word
+                    add_word(cleanWord);
                 }
             });
         });
     }
 
-    // 🛠️ 辅助：原生中文分词器 + 强力停用词过滤 (注入给 MiniSearch)
+    // 🛠️ 辅助：中文分词器 + 强力停用词过滤 (注入给 MiniSearch)
     _tokenize(text) {
         if (!text) return [];
 
-        // 🟢 1. 使用原生引擎切词
-        const rawTokens = Array.from(segmenter.segment(text)).map(
-            (s) => s.segment,
-        );
-
-        // 🟢 2. 专有名词保护机制：只要文本包含词典中的词，强制作为独立 Token 存活
-        // 这确保了摘要 API 自动更新的剧情节点不会被引擎切碎
-        customDictPool.forEach((word) => {
-            if (text.includes(word)) {
-                rawTokens.push(word);
-            }
-        });
+        const rawTokens = cut_for_search(text, true);
 
         const stopWords = new Set([
-            // === 1. 代词与指代 ===
+            // === 1. 代词与指代 (极高频，毫无区分度) ===
             "我",
             "你",
             "他",
@@ -73,6 +60,7 @@ class BM25Engine {
             "它",
             "我们",
             "你们",
+            "他们",
             "他们",
             "它们",
             "自己",
@@ -86,7 +74,8 @@ class BM25Engine {
             "哪些",
             "这些",
             "那些",
-            // === 2. 助词与语气词 ===
+
+            // === 2. 助词与语气词 (句法骨架与口癖废话) ===
             "的",
             "了",
             "着",
@@ -105,7 +94,8 @@ class BM25Engine {
             "咦",
             "诶",
             "咯",
-            // === 3. 连词、介词与方位词 ===
+
+            // === 3. 连词、介词与方位词 (逻辑与空间连接) ===
             "和",
             "并",
             "以",
@@ -141,7 +131,8 @@ class BM25Engine {
             "不过",
             "然后",
             "接着",
-            // === 4. 程度副词、频次与时间 ===
+
+            // === 4. 程度副词、频次与时间 (削弱强度的修饰词) ===
             "就",
             "都",
             "才",
@@ -165,7 +156,8 @@ class BM25Engine {
             "有点",
             "一点",
             "一下",
-            // === 5. 基础状态与高频泛用动词 ===
+
+            // === 5. 基础状态与高频泛用动词 (缺乏实体指向性) ===
             "是",
             "有",
             "去",
@@ -177,6 +169,7 @@ class BM25Engine {
             "开始",
             "准备",
             "继续",
+
             // === 6. 量词与文本切割残留 ===
             "个",
             "一段",
@@ -185,7 +178,8 @@ class BM25Engine {
             "一个",
             "一丝",
             "极其",
-            // === 8. 🎭 RP 专属：环境神态与主观臆测 ===
+
+            // === 8. 🎭 RP 专属：环境神态与主观臆测 (防氛围污染) ===
             "微微",
             "轻轻",
             "缓缓",
@@ -204,7 +198,7 @@ class BM25Engine {
             if (!t) return false;
             if (stopWords.has(t)) return false;
 
-            // 只要不包含"中文"或"英文字母"，就干掉（专杀纯标点、纯数字）
+            // 🟢 核心修复：只要不包含"中文"或"英文字母"，就统统干掉（专杀纯标点、纯数字）
             if (!/[\u4e00-\u9fa5a-zA-Z]/.test(t)) return false;
 
             return true;
