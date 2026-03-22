@@ -2439,6 +2439,7 @@ async function init(router) {
                         uniqueUserEntities,
                         bm25Configs.chat,
                         temporalIntent,
+                        ignore_ids,
                     );
 
                     intentResults = intentResults.map((r) => {
@@ -2492,6 +2493,7 @@ async function init(router) {
                         bm25Configs.chat,
                         remainingK,
                         "chat",
+                        ignore_ids,
                     );
                     console.log(
                         `[Anima BM25 Debug] 📊 常规模糊检索执行完毕，返回了 ${standardResults.length} 条结果。`,
