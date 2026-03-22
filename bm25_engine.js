@@ -554,7 +554,13 @@ class BM25Engine {
      * @param {number} topK - 截取数量
      * @param {string} type - 'chat' | 'kb'
      */
-    async searchPipeline(queryText, dbConfigs, topK = 3, type = "chat") {
+    async searchPipeline(
+        queryText,
+        dbConfigs,
+        topK = 3,
+        type = "chat",
+        ignoreIds = [],
+    ) {
         if (!queryText || dbConfigs.length === 0) return [];
 
         // ✨ 新增：检索前，把本次检索涉及到的所有词典规则，都教给分词器
@@ -664,6 +670,22 @@ class BM25Engine {
                 combineWith: "OR",
             });
 
+            // 🟢 [新增核心逻辑]：剔除最近 N 楼的切片
+            if (ignoreIds && ignoreIds.length > 0) {
+                const beforeCount = results.length;
+                results = results.filter(
+                    (res) =>
+                        !ignoreIds.includes(String(res.id)) &&
+                        !ignoreIds.includes(String(res.index)),
+                );
+                // 打印跳过日志 (只有确实过滤掉了切片才打印，避免刷屏)
+                if (beforeCount > results.length) {
+                    console.log(
+                        `[Anima BM25] 🛡️ 触发防重复机制，已跳过 ${beforeCount - results.length} 个最新切片。`,
+                    );
+                }
+            }
+
             // 🌟 核心修复：精准数组比对与平滑加权
             if (results.length > 0 && matchedIndexWords.length > 0) {
                 results = results.filter((res) => {
@@ -753,7 +775,12 @@ class BM25Engine {
     /**
      * 🧠 核心 3：时间极值意图拦截器 (智能降级版)
      */
-    async temporalIntentSearch(entities, dbConfigs, intentType) {
+    async temporalIntentSearch(
+        entities,
+        dbConfigs,
+        intentType,
+        ignoreIds = [],
+    ) {
         if (!entities || entities.length === 0 || dbConfigs.length === 0)
             return [];
 
@@ -792,10 +819,26 @@ class BM25Engine {
             }
 
             // 用 OR 逻辑粗筛
-            const results = miniSearch.search(entities.join(" "), {
+            let results = miniSearch.search(entities.join(" "), {
                 prefix: false,
                 combineWith: "OR",
             });
+
+            // 🟢 [新增核心逻辑]：剔除最近 N 楼的切片，防止重复回响
+            if (ignoreIds && ignoreIds.length > 0) {
+                const beforeCount = results.length;
+                results = results.filter(
+                    (res) =>
+                        !ignoreIds.includes(String(res.id)) &&
+                        !ignoreIds.includes(String(res.index)),
+                );
+                // 打印跳过日志 (只有确实过滤掉了切片才打印，避免刷屏)
+                if (beforeCount > results.length) {
+                    console.log(
+                        `[Anima BM25] 🛡️ 触发防重复机制，已跳过 ${beforeCount - results.length} 个最新切片。`,
+                    );
+                }
+            }
 
             // 严格核对 Tags (防误杀：只收录真实验明正身的切片)
             results.forEach((res) => {
