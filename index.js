@@ -1,3 +1,5 @@
+const { ProxyAgent } = require("undici");
+
 if (typeof global.File === "undefined") {
     console.log(
         "[Anima RAG] ⚠️ 检测到旧版 Node.js (< v20)，正在注入 File Polyfill...",
@@ -3576,6 +3578,70 @@ async function init(router) {
                 physicalCount: physicalDeleteCount,
             });
         });
+    });
+
+    router.post("/proxy/forward", async (req, res) => {
+        const { targetUrl, method, headers, body, isStream } = req.body;
+        if (!targetUrl)
+            return res.status(400).json({ error: "Missing targetUrl" });
+
+        try {
+            console.log(
+                `[Anima Proxy] 🌐 转发 -> ${method || "GET"} ${targetUrl}`,
+            );
+            const fetchOptions = {
+                method: method || "GET",
+                headers: headers || {},
+            };
+            if (body)
+                fetchOptions.body =
+                    typeof body === "string" ? body : JSON.stringify(body);
+
+            // 🌟 核心修复：根据 targetUrl 智能判断是否挂载代理
+            // 如果是请求本地（如 127.0.0.1, localhost, 或者你局域网的 192.168 等），则绕过代理 (bypass)
+            const isLocal =
+                targetUrl.includes("127.0.0.1") ||
+                targetUrl.includes("localhost") ||
+                targetUrl.includes("192.168.");
+
+            if (!isLocal) {
+                // 如果是外网请求，强行挂上你的 Clash 代理
+                fetchOptions.dispatcher = new ProxyAgent(
+                    "http://127.0.0.1:7890",
+                );
+                // console.log(`[Anima Proxy] 🛡️ 挂载代理: 127.0.0.1:7890`);
+            }
+
+            const response = await fetch(targetUrl, fetchOptions);
+
+            if (!response.ok) {
+                const errText = await response.text();
+                return res.status(response.status).send(errText);
+            }
+
+            if (isStream) {
+                res.setHeader("Content-Type", "text/event-stream");
+                res.setHeader("Cache-Control", "no-cache");
+                res.setHeader("Connection", "keep-alive");
+                if (response.body.pipe) {
+                    response.body.pipe(res);
+                } else {
+                    const reader = response.body.getReader();
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        res.write(Buffer.from(value));
+                    }
+                    res.end();
+                }
+            } else {
+                const data = await response.json();
+                res.json(data);
+            }
+        } catch (error) {
+            console.error(`[Anima Proxy] 崩溃:`, error);
+            res.status(500).json({ error: error.message });
+        }
     });
 
     console.log("[Anima RAG] 后端服务已启动 (支持多聊天隔离)");
