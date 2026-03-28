@@ -1,4 +1,16 @@
 const { ProxyAgent } = require("undici");
+const path = require("path");
+const fs = require("fs");
+const yaml = require("js-yaml");
+const { LocalIndex } = require("vectra");
+const AdmZip = require("adm-zip");
+const bm25Engine = require("./bm25_engine");
+
+let stProxyConfig = {
+    enabled: false,
+    url: "",
+    bypass: ["localhost", "127.0.0.1"],
+};
 
 if (typeof global.File === "undefined") {
     console.log(
@@ -20,12 +32,6 @@ if (typeof global.fetch === "undefined") {
         "[Anima RAG] ❌ 致命错误: 当前 Node.js 版本过低，不支持 fetch。请升级至 Node 18+ (推荐 v20)",
     );
 }
-
-const path = require("path");
-const fs = require("fs");
-const { LocalIndex } = require("vectra");
-const AdmZip = require("adm-zip");
-const bm25Engine = require("./bm25_engine");
 
 const VECTOR_ROOT = path.join(__dirname, "vectors");
 const SESSION_ROOT = path.join(__dirname, "data", "sessions");
@@ -1180,6 +1186,37 @@ async function init(router) {
         fs.mkdirSync(VECTOR_ROOT, { recursive: true });
     }
     console.log("[Anima RAG] 向量存储根目录就绪:", VECTOR_ROOT);
+
+    // ✨ 新增：自动读取 SillyTavern 全局的 config.yaml 代理配置
+    try {
+        const configPath = path.join(__dirname, "../../config.yaml");
+        if (fs.existsSync(configPath)) {
+            const configData = yaml.load(fs.readFileSync(configPath, "utf8"));
+            if (
+                configData &&
+                configData.requestProxy &&
+                configData.requestProxy.enabled
+            ) {
+                stProxyConfig.enabled = true;
+                stProxyConfig.url = configData.requestProxy.url;
+                if (Array.isArray(configData.requestProxy.bypass)) {
+                    stProxyConfig.bypass = configData.requestProxy.bypass;
+                }
+                console.log(
+                    `[Anima Proxy] 🛡️ 已继承 ST 全局代理配置: ${stProxyConfig.url}`,
+                );
+            } else {
+                console.log(
+                    `[Anima Proxy] ⚡ ST 未开启代理，API 请求将使用本机直连网络`,
+                );
+            }
+        }
+    } catch (e) {
+        console.warn(
+            "[Anima Proxy] ⚠️ 读取 ST config.yaml 失败，将默认使用直连:",
+            e.message,
+        );
+    }
 
     // API: 存入
     router.post("/insert", async (req, res) => {
@@ -3597,19 +3634,31 @@ async function init(router) {
                 fetchOptions.body =
                     typeof body === "string" ? body : JSON.stringify(body);
 
-            // 🌟 核心修复：根据 targetUrl 智能判断是否挂载代理
-            // 如果是请求本地（如 127.0.0.1, localhost, 或者你局域网的 192.168 等），则绕过代理 (bypass)
-            const isLocal =
-                targetUrl.includes("127.0.0.1") ||
-                targetUrl.includes("localhost") ||
-                targetUrl.includes("192.168.");
+            // =========================================================
+            // ✨ 核心修改：根据 ST 的配置智能判断是否挂载代理
+            // =========================================================
+            let useProxy = false;
 
-            if (!isLocal) {
-                // 如果是外网请求，强行挂上你的 Clash 代理
-                fetchOptions.dispatcher = new ProxyAgent(
-                    "http://127.0.0.1:7890",
+            if (stProxyConfig.enabled && stProxyConfig.url) {
+                useProxy = true;
+                // 检查是否在 bypass (直连) 豁免名单中
+                for (const bypassUrl of stProxyConfig.bypass) {
+                    if (targetUrl.includes(bypassUrl)) {
+                        useProxy = false;
+                        break;
+                    }
+                }
+            }
+
+            if (useProxy) {
+                // 挂载 ST 配置的动态代理
+                fetchOptions.dispatcher = new ProxyAgent(stProxyConfig.url);
+                console.log(
+                    `[Anima Proxy] 🛡️ 正在使用代理转发: ${stProxyConfig.url}`,
                 );
-                // console.log(`[Anima Proxy] 🛡️ 挂载代理: 127.0.0.1:7890`);
+            } else {
+                // ⚡ 不配置 dispatcher，原生走直连
+                console.log(`[Anima Proxy] ⚡ 正在使用直连转发 (无代理)`);
             }
 
             const response = await fetch(targetUrl, fetchOptions);
