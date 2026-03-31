@@ -116,7 +116,7 @@ function chunkText(text, strategy) {
     return chunks;
 }
 
-function loadSession(sessionId) {
+async function loadSession(sessionId) {
     if (!sessionId) return { memories: [] };
     try {
         const safeId = sessionId.replace(
@@ -127,7 +127,8 @@ function loadSession(sessionId) {
 
         if (!fs.existsSync(filePath)) return { memories: [] };
 
-        const data = fs.readFileSync(filePath, "utf-8");
+        // 🟢 使用异步 fs.promises
+        const data = await fs.promises.readFile(filePath, "utf-8");
         return JSON.parse(data) || { memories: [] };
     } catch (e) {
         console.warn(
@@ -138,7 +139,7 @@ function loadSession(sessionId) {
 }
 
 // ✅ [新增] 保存会话记忆
-function saveSession(sessionId, data) {
+async function saveSession(sessionId, data) {
     if (!sessionId) return;
     try {
         const safeId = sessionId.replace(
@@ -146,13 +147,17 @@ function saveSession(sessionId, data) {
             "_",
         );
 
-        // 确保目录存在
         if (!fs.existsSync(SESSION_ROOT)) {
             fs.mkdirSync(SESSION_ROOT, { recursive: true });
         }
 
         const filePath = path.join(SESSION_ROOT, `${safeId}.json`);
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+        // 🟢 使用异步 fs.promises
+        await fs.promises.writeFile(
+            filePath,
+            JSON.stringify(data, null, 2),
+            "utf-8",
+        );
     } catch (e) {
         console.error(
             `[Anima Session] Save failed for ${sessionId}: ${e.message}`,
@@ -339,10 +344,13 @@ async function getEmbedding(text, config) {
     try {
         const fetchUrl = `${config.url.replace(/\/+$/, "")}/embeddings`;
 
-        // 🔥 [新增调试日志] 打印正在请求的 URL
         console.log(
             `[Anima Debug] Embedding Request -> URL: ${fetchUrl}, Model: ${config.model}`,
         );
+
+        // 🟢 新增：15秒硬性超时控制 (防止 Node.js 原生 fetch 无限挂起)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
 
         const response = await fetch(fetchUrl, {
             method: "POST",
@@ -354,7 +362,10 @@ async function getEmbedding(text, config) {
                 input: text,
                 model: config.model,
             }),
+            signal: controller.signal, // 🟢 绑定超时中断信号
         });
+
+        clearTimeout(timeoutId); // 🟢 拿到响应后，立刻清除定时器
 
         if (!response.ok) {
             const errText = await response.text();
@@ -362,17 +373,12 @@ async function getEmbedding(text, config) {
             try {
                 // 尝试解析 JSON
                 const errJson = JSON.parse(errText);
-                // 优先取 error.message (OpenAI标准), 其次 message, 最后 raw
                 cleanMessage =
                     errJson.error?.message ||
                     errJson.message ||
                     JSON.stringify(errJson);
             } catch (e) {
-                // 解析失败，说明是 HTML (如 Nginx 报错页)
-                // 1. 使用正则剥离所有标签
                 let stripped = errText.replace(/<[^>]*>?/gm, "").trim();
-                // 2. 截取前 100 字符，防止整页 HTML 文本刷屏
-                // 3. 移除多余空白符
                 cleanMessage = stripped.replace(/\s+/g, " ").substring(0, 100);
                 if (!cleanMessage)
                     cleanMessage = `HTTP Error ${response.status}`;
@@ -383,7 +389,16 @@ async function getEmbedding(text, config) {
         const data = await response.json();
         return data.data[0].embedding;
     } catch (error) {
-        // 🔥 [新增调试日志] 打印网络层面的错误原因
+        // 🟢 新增：精准拦截超时错误，转化为明确的文字报错
+        if (error.name === "AbortError") {
+            console.error(
+                "[Anima RAG] ❌ 向量 API 请求超时无响应 (已主动掐断)",
+            );
+            throw new Error(
+                "向量 API 请求超时无响应，请检查代理节点或网络稳定性",
+            );
+        }
+
         console.error(
             "[Anima RAG] Embedding Failed (Network/Code):",
             error.cause || error,
@@ -1629,7 +1644,7 @@ async function init(router) {
                     .json({ success: false, message: "未找到该库的实体文件" });
             }
 
-            const data = fs.readFileSync(filePath, "utf-8");
+            const data = await fs.promises.readFile(filePath, "utf-8");
             res.json({ success: true, data: JSON.parse(data) });
         } catch (e) {
             console.error(`[Anima BM25] 导出库失败: ${e.message}`);
@@ -1713,7 +1728,7 @@ async function init(router) {
 
                 // MiniSearch 导出的 JSON 中，storedFields 保存了完整的原始信息
                 const indexData = JSON.parse(
-                    fs.readFileSync(bm25Path, "utf-8"),
+                    await fs.promises.readFile(bm25Path, "utf-8"),
                 );
                 const allDocs = Object.values(indexData.storedFields || {});
 
@@ -1872,7 +1887,7 @@ async function init(router) {
 
                     if (fs.existsSync(bm25Path)) {
                         const indexData = JSON.parse(
-                            fs.readFileSync(bm25Path, "utf-8"),
+                            await fs.promises.readFile(bm25Path, "utf-8"),
                         );
                         const allDocs = Object.values(
                             indexData.storedFields || {},
@@ -2070,7 +2085,7 @@ async function init(router) {
                 );
                 if (fs.existsSync(bm25Path)) {
                     const indexData = JSON.parse(
-                        fs.readFileSync(bm25Path, "utf-8"),
+                        await fs.promises.readFile(bm25Path, "utf-8"),
                     );
                     const allDocs = Object.values(indexData.storedFields || {});
 
@@ -2147,7 +2162,7 @@ async function init(router) {
 
             if (sessionId) {
                 // 读取 Session
-                const loaded = loadSession(sessionId);
+                const loaded = await loadSession(sessionId);
                 // 确保 memories 存在，且如果是数组(旧数据)要转为对象，如果是对象则直接用
                 if (Array.isArray(loaded.memories)) {
                     // 兼容旧数据的兜底逻辑：把数组转为 ID Map
@@ -2843,7 +2858,7 @@ async function init(router) {
                         finalChatResults = [...finalChatResults, ...echoItems];
                     }
 
-                    saveSession(sessionId, {
+                    await saveSession(sessionId, {
                         lastUpdated: Date.now(),
                         memories: nextMemories,
                     });
