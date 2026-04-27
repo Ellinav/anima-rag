@@ -387,6 +387,30 @@ async function getEmbedding(text, config) {
         }
 
         const data = await response.json();
+
+        // 🛡️ 新增防御性校验：确保 data.data 是一个数组，且至少有一条数据
+        if (
+            !data ||
+            !data.data ||
+            !Array.isArray(data.data) ||
+            data.data.length === 0
+        ) {
+            // 提取可能的实际错误信息返回给用户
+            const actualResponse = JSON.stringify(data).substring(0, 150); // 截取前150个字符防止日志炸裂
+            console.error(
+                `[Anima RAG] ❌ 向量 API 返回了异常的数据结构:`,
+                actualResponse,
+            );
+            throw new Error(
+                `向量 API 数据解析失败。请检查 API 厂商格式或模型是否正确。API 返回: ${actualResponse}...`,
+            );
+        }
+
+        // 🛡️ 校验内部是否真的有 embedding 字段
+        if (!data.data[0].embedding) {
+            throw new Error("向量 API 返回了数据，但未找到 embedding 字段。");
+        }
+
         return data.data[0].embedding;
     } catch (error) {
         // 🟢 新增：精准拦截超时错误，转化为明确的文字报错
